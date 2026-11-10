@@ -1,0 +1,1332 @@
+--=====================================================================
+--  AUTO FISH LEVEL  (Dashboard + External Config)
+--  ลำดับ: ฟามเงินด้วยสเต็ก -> ฝาก ATM -> ถอน 5500 -> ซื้อเบ็ด+เหยื่อ
+--         -> ถือเบ็ด -> ตกปลาตามเลเวล -> เหยื่อหมดไปขายปลา/ฝาก/ซื้อเหยื่อใหม่
+--  [แก้ไข] ปรับปรุงส่วนฟามเงิน/สเต็กให้ตรงกับเวอร์ชันที่ฟิกบัคแล้ว
+--=====================================================================
+local Players      = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RS           = game:GetService("ReplicatedStorage")
+local player       = Players.LocalPlayer
+
+--// กันรันซ้ำ
+local env = (getgenv and getgenv()) or _G
+env.AF_RUN_ID = (env.AF_RUN_ID or 0) + 1
+local RUN_ID = env.AF_RUN_ID
+local function alive() return env.AF_RUN_ID == RUN_ID end
+for _, n in ipairs({ "AutoFishStatus", "AutoFishDashboard" }) do
+    local o = player:WaitForChild("PlayerGui"):FindFirstChild(n)
+    if o then o:Destroy() end
+end
+
+--=====================================================================
+--  CONFIG
+--=====================================================================
+local V = Vector3.new
+
+local CFG = {
+    TARGET_MONEY = 5500,
+    DEPOSIT_AT   = 600,
+    BAIT_PRICE   = 45,
+    BAIT_COUNT   = 11,
+    SPEED        = 150,
+    SPEED_ACCEPT = 50,
+    ROD_ID       = "FishingRodUltimate",
+    BAIT_ID      = "PrawntecUltimate",
+    BAIT_MATCH   = "prawn",
+    ROD_SLOT     = 2,
+    SELL_WAIT    = 4,
+    SHOP_WAIT    = 4,
+    WAIT_BEFORE_REMOTE = 8,
+    AFTER_FINISH_WAIT  = 3,
+}
+
+do
+    local USER = env.AutoFishConfig
+    local function pick(key, lo, hi)
+        if type(USER) ~= "table" or USER[key] == nil then return end
+        local v = tonumber(USER[key])
+        if not v then
+            warn("[AutoFish] คอนฟิก " .. key .. " ไม่ใช่ตัวเลข ใช้ค่าเดิม " .. tostring(CFG[key]))
+            return
+        end
+        CFG[key] = math.clamp(math.floor(v), lo, hi)
+    end
+    pick("TARGET_MONEY", 1, 100000000)
+    pick("DEPOSIT_AT",   1, 100000000)
+    pick("BAIT_COUNT",   1, 500)
+    pick("SPEED",        16, 400)
+end
+
+local P = {
+    COOK_ACCEPT = V(-238.11, 256.15, 340.17),
+    COOK_FRIDGE = V(-277.66, 256.15, 337.00),
+    COOK_GRILL  = V(-266.41, 256.15, 337.14),
+    ATM         = V(-224.98, 254.90, 485.51),
+    SHOP        = V(-136.71, 255.08, 153.30),
+    SELL        = V(-253.15, 256.08, 381.65),
+}
+
+local ZONES = {
+    { name = "โซน 1 (Lv 1-9)",  minLv = 1,
+      stand = V(106.90, 243.49, -793.63),
+      cast  = V(138.88841247558594, 239.48710632324219, -825.2811279296875) },
+    { name = "โซน 2 (Lv 10-24)", minLv = 10,
+      stand = V(451.18, 216.17, -891.34),
+      cast  = V(481.9892578125, 212.169921875, -924.13189697265625) },
+    { name = "โซน 3 (Lv 25+)",  minLv = 25,
+      stand = V(-431.80, 233.95, 849.43),
+      cast  = V(-453.96371459960938, 229.82894897460938, 809.87103271484375) },
+}
+
+--=====================================================================
+--  REMOTES
+--=====================================================================
+local FishingRemote = RS:WaitForChild("MD_FishingRemote", 10)
+local ATMRemote     = RS:WaitForChild("MD_ATMRemote", 10)
+local RentalRemote  = RS:WaitForChild("MD_HouseRentalRemote", 10)
+local ItemsEvent    = RS:WaitForChild("MD_ItemsEvent", 10)
+local CookRemote    = RS:WaitForChild("MD_CookRemote", 10)
+local CashFX        = RS:WaitForChild("MD_CashPickupFX", 10)
+
+if RentalRemote then
+    pcall(function()
+        RentalRemote.OnClientEvent:Connect(function(...)
+            if not alive() then return end
+            local parts = {}
+            for _, v in ipairs({ ... }) do table.insert(parts, tostring(v)) end
+            print("[AutoFish] 🏪 Rental:", table.concat(parts, " | "))
+        end)
+    end)
+end
+
+--=====================================================================
+--  STATE
+--=====================================================================
+local running      = false
+local loopActive   = false
+local activeTween  = nil
+local activeBeam   = nil
+local statusSetter = nil
+local shiftStarted = false
+local rodOwned     = false
+local needSell     = true
+local catchCount   = 0
+local lastEquipTry = 0
+local baitFailCount = 0
+local manualTest = false
+local phase = "IDLE"          -- IDLE / COOK / BUY / RESUPPLY / FISH
+local curZone = nil
+local toastFn = nil
+local lastFeedback = ""
+local hasTouchInterest = (type(firetouchinterest) == "function")
+
+--=====================================================================
+--  HELPERS
+--=====================================================================
+local function notify(title, content, dur)
+    print("[AutoFish]", title, content)
+    if toastFn then pcall(toastFn, title, content, dur or 3) end
+end
+
+local function setStatus(text, color)
+    if statusSetter then pcall(statusSetter, text, color or Color3.fromRGB(200, 200, 200)) end
+    print("[AutoFish]", text)
+end
+
+local function getCash() return math.floor(tonumber(player:GetAttribute("Cash")) or 0) end
+local function getBank() return math.floor(tonumber(player:GetAttribute("MD_Bank")) or 0) end
+local function getFishLevel() return math.floor(tonumber(player:GetAttribute("MD_FishingLevel")) or 1) end
+local function totalMoney() return getCash() + getBank() end
+
+local function getChar() return player.Character or player.CharacterAdded:Wait() end
+local function getHRP()
+    local c = player.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function findTool(pred)
+    for _, container in ipairs({ player:FindFirstChildOfClass("Backpack"), player.Character }) do
+        if container then
+            for _, t in ipairs(container:GetChildren()) do
+                if t:IsA("Tool") and pred(t) then return t end
+            end
+        end
+    end
+    return nil
+end
+
+local function hasRod()
+    return findTool(function(t) return t.Name == CFG.ROD_ID end) ~= nil
+end
+
+local function heldRod()
+    local c = player.Character
+    return c and c:FindFirstChild(CFG.ROD_ID) ~= nil
+end
+
+local function getBaitCount()
+    local n = 0
+    for _, container in ipairs({ player:FindFirstChildOfClass("Backpack"), player.Character }) do
+        if container then
+            for _, t in ipairs(container:GetChildren()) do
+                if t:IsA("Tool")
+                    and t:GetAttribute("MD_FarmItem") == true
+                    and t.Name:lower():find(CFG.BAIT_MATCH, 1, true) then
+                    n = n + (tonumber(t:GetAttribute("MD_StackCount")) or 1)
+                end
+            end
+        end
+    end
+    return n
+end
+
+local function pickZone(lv)
+    local z = ZONES[1]
+    for _, zz in ipairs(ZONES) do
+        if lv >= zz.minLv then z = zz end
+    end
+    return z
+end
+
+--=====================================================================
+--  MOVEMENT (Tween)
+--=====================================================================
+local function showBeam(fromPos, toPos, duration)
+    if activeBeam and activeBeam.Parent then activeBeam:Destroy() end
+    local dist = (toPos - fromPos).Magnitude
+    if dist < 2 then return end
+    local part = Instance.new("Part")
+    part.Name = "AutoFishGuide"
+    part.Anchored = true; part.CanCollide = false
+    part.CanQuery = false; part.CanTouch = false
+    part.Material = Enum.Material.Neon
+    part.Color = Color3.fromRGB(0, 255, 170)
+    part.Transparency = 0.35
+    part.Size = Vector3.new(0.4, 0.4, dist)
+    part.CFrame = CFrame.lookAt((fromPos + toPos) / 2, toPos)
+    part.Parent = workspace
+    activeBeam = part
+    task.delay(duration + 0.5, function()
+        if part and part.Parent then part:Destroy() end
+    end)
+end
+
+local function tweenWalk(targetPos, speed)
+    local char = getChar()
+    local hrp = char:WaitForChild("HumanoidRootPart", 5)
+    if not hrp then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then hum.WalkSpeed = speed end
+
+    local startPos = hrp.Position
+    local flatDist = (Vector3.new(startPos.X, 0, startPos.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+    if flatDist < 2 then
+        pcall(function() hrp.CFrame = CFrame.new(targetPos) end)
+        return true
+    end
+
+    local duration = math.max(flatDist / speed, 0.2)
+    showBeam(startPos, targetPos, duration)
+
+    if activeTween then pcall(function() activeTween:Cancel() end) end
+    activeTween = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear), { CFrame = CFrame.new(targetPos) })
+    local done = false
+    local conn = activeTween.Completed:Connect(function() done = true end)
+    activeTween:Play()
+
+    local t = 0
+    while not done and t < duration + 5 do
+        task.wait(0.05); t = t + 0.05
+        if not running or not alive() then pcall(function() activeTween:Cancel() end) break end
+        if not hrp or not hrp.Parent then break end
+    end
+    conn:Disconnect(); activeTween = nil
+    if hrp and hrp.Parent then pcall(function() hrp.CFrame = CFrame.new(targetPos) end) end
+    return true
+end
+
+--=====================================================================
+--  COOK (ฟามเงิน)  [ปรับปรุงจากเวอร์ชันฟิกบัค]
+--=====================================================================
+local onAccepted
+local FEEDBACK_ACCEPT = "Shift started. Get steak from the fridge."
+
+if CookRemote then
+    CookRemote.OnClientEvent:Connect(function(action, ...)
+        if not alive() then return end
+        local msg = tostring(({ ... })[1] or "")
+        if action == "Feedback" then
+            lastFeedback = msg
+            print("[AutoFish] 📢 Feedback:", msg)
+            local lower = msg:lower()
+            if (lower:find("shift started") or lower:find("get steak")) and not shiftStarted then
+                shiftStarted = true
+                print("[AutoFish] ✅ shiftStarted = true (จาก server)")
+                if onAccepted then onAccepted() end
+            end
+        else
+            print("[AutoFish] 📡 OnClientEvent:", action, msg)
+        end
+    end)
+end
+
+local function resolve(...)
+    local obj = workspace
+    for _, n in ipairs({ ... }) do
+        if type(n) == "number" then obj = obj:GetChildren()[n] else obj = obj:FindFirstChild(n) end
+        if not obj then return nil end
+    end
+    return obj
+end
+
+local function getShiftObj()
+    return resolve("Map", "Tiles", "ShoppingTile", "SteakHouse", "Interior", "SteakHouseBeacon", "TouchPart", "MD_CookShift")
+end
+
+local function getFridgeObj()
+    local interior = resolve("Map", "Tiles", "ShoppingTile", "SteakHouse", "Interior")
+    if not interior then return nil end
+    local fridge = interior:FindFirstChild("Fridge")
+    if not fridge then return nil end
+    local base = fridge:FindFirstChild("Base")
+    if base then return base:FindFirstChild("MD_CookFridge") or base end
+    for _, d in pairs(fridge:GetDescendants()) do
+        if d.Name == "MD_CookFridge" then return d end
+    end
+    return nil
+end
+
+local function objPos(obj)
+    if not obj then return nil end
+    if obj:IsA("BasePart") then return obj.Position end
+    if obj:IsA("Model") then
+        local ok, cf = pcall(function() return obj:GetPivot() end)
+        if ok and cf then return cf.Position end
+    end
+    local par = obj.Parent
+    while par and par ~= workspace do
+        if par:IsA("BasePart") then return par.Position end
+        if par:IsA("Model") then
+            local ok, cf = pcall(function() return par:GetPivot() end)
+            if ok and cf then return cf.Position end
+        end
+        par = par.Parent
+    end
+    return nil
+end
+
+local function getGrillObj()
+    local interior = resolve("Map", "Tiles", "ShoppingTile", "SteakHouse", "Interior")
+    if not interior then return nil end
+    local candidates = {}
+    for _, d in ipairs(interior:GetDescendants()) do
+        if d.Name == "MD_CookGrill" then
+            table.insert(candidates, d)
+        elseif d.Name == "GrillArea" and not d:FindFirstChild("MD_CookGrill", true) then
+            table.insert(candidates, d)
+        end
+    end
+    local best, bestDist
+    for _, c in ipairs(candidates) do
+        local pos = objPos(c)
+        if pos then
+            local dist = (pos - P.COOK_GRILL).Magnitude
+            if not bestDist or dist < bestDist then best, bestDist = c, dist end
+        end
+    end
+    if best then return best, bestDist end
+    local c65 = interior:GetChildren()[65]
+    local ga = c65 and c65:FindFirstChild("GrillArea")
+    if ga then return ga:FindFirstChild("MD_CookGrill") or ga end
+    return nil
+end
+
+local function prepPrompt(p)
+    pcall(function()
+        p.Enabled = true
+        p.RequiresLineOfSight = false
+        p.HoldDuration = 0
+        if p.MaxActivationDistance < 30 then p.MaxActivationDistance = 30 end
+    end)
+end
+
+local function findTouchPart(obj)
+    if obj:IsA("BasePart") then return obj end
+    if obj:IsA("Model") then return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true) end
+    local inner = obj:FindFirstChildWhichIsA("BasePart", true)
+    if inner then return inner end
+    local par = obj.Parent
+    if par and par:IsA("BasePart") then return par end
+    if par and par:IsA("Model") then return par.PrimaryPart or par:FindFirstChildWhichIsA("BasePart", true) end
+    return nil
+end
+
+-- ⭐ interact ที่มี label บอกว่ากดอะไร (ปรับปรุงจากเวอร์ชันฟิกบัค)
+local function interact(obj, label)
+    if not obj then
+        print("[Interact]", label or "?", "= nil")
+        return false
+    end
+    print(("[Interact] %s → %s [%s]"):format(label or "?", obj:GetFullName(), obj.ClassName))
+    local handled = false
+    if obj:IsA("ProximityPrompt") then
+        prepPrompt(obj); pcall(fireproximityprompt, obj); handled = true
+    elseif obj:IsA("ClickDetector") then
+        pcall(fireclickdetector, obj); handled = true
+    elseif obj:IsA("RemoteEvent") then
+        for _, a in ipairs({ "Start", "Accept", "Begin", "Open", "Trigger" }) do
+            pcall(function() obj:FireServer(a) end)
+        end
+        pcall(function() obj:FireServer() end)
+        handled = true
+    end
+    for _, d in pairs(obj:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            prepPrompt(d); pcall(fireproximityprompt, d); handled = true
+        elseif d:IsA("ClickDetector") then
+            pcall(fireclickdetector, d); handled = true
+        end
+    end
+    if hasTouchInterest then
+        local tp = findTouchPart(obj)
+        local hrp = getHRP()
+        if tp and hrp then
+            pcall(function() firetouchinterest(hrp, tp, 0) end)
+            task.wait(0.05)
+            pcall(function() firetouchinterest(hrp, tp, 1) end)
+            handled = true
+        end
+    end
+    return handled
+end
+
+local function pressShiftOnce()
+    local obj = getShiftObj()
+    if not obj then
+        print("[AutoFish] ❌ ไม่เจอ MD_CookShift")
+        return false
+    end
+    print(("[AutoFish] กดรับงาน → %s [%s]"):format(obj:GetFullName(), obj.ClassName))
+    local prompt = obj:IsA("ProximityPrompt") and obj or obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if prompt then
+        pcall(function() prompt.Enabled = true end)
+        pcall(fireproximityprompt, prompt)
+        return true
+    end
+    local cd = obj:IsA("ClickDetector") and obj or obj:FindFirstChildWhichIsA("ClickDetector", true)
+    if cd then pcall(fireclickdetector, cd); return true end
+    local part = obj:IsA("BasePart") and obj or obj.Parent
+    local hrp = getHRP()
+    if hasTouchInterest and part and part:IsA("BasePart") and hrp then
+        pcall(function() firetouchinterest(hrp, part, 0) end)
+        task.wait(0.05)
+        pcall(function() firetouchinterest(hrp, part, 1) end)
+        return true
+    end
+    return false
+end
+
+onAccepted = function()
+    notify("✅ รับงานสำเร็จ", FEEDBACK_ACCEPT, 3)
+    setStatus("✅ " .. FEEDBACK_ACCEPT, Color3.fromRGB(0, 255, 120))
+end
+
+local function stepAccept()
+    if shiftStarted then return true end
+    setStatus("🚶 ไปจุดรับงาน (speed " .. CFG.SPEED_ACCEPT .. ")")
+    tweenWalk(P.COOK_ACCEPT, CFG.SPEED_ACCEPT)
+    task.wait(0.3)
+    setStatus("🔵 กดรับงาน (ครั้งเดียว)...")
+    pressShiftOnce()
+    local t = 0
+    while running and alive() and not shiftStarted and t < 4 do
+        task.wait(0.1); t = t + 0.1
+    end
+    if not shiftStarted then
+        setStatus("⚠️ server ยังไม่ตอบ จะลองใหม่", Color3.fromRGB(255, 200, 80))
+    end
+    return shiftStarted
+end
+
+local function stepFridge()
+    setStatus("🚶 ไปตู้เย็น")
+    tweenWalk(P.COOK_FRIDGE, CFG.SPEED)
+    task.wait(0.3)
+    setStatus("🧊 กด MD_CookFridge")
+    for i = 1, 5 do
+        if not running then return end
+        interact(getFridgeObj(), "MD_CookFridge")
+        task.wait(0.4)
+    end
+    task.wait(0.4)
+end
+
+local function stepGrill()
+    setStatus("🚶 ไปเตาย่าง")
+    tweenWalk(P.COOK_GRILL, CFG.SPEED)
+    task.wait(0.3)
+    local hrp = getHRP()
+
+    local grill, gdist = getGrillObj()
+    if grill then
+        print(("[AutoFish] เตาที่เลือก: %s [%s] ห่าง POS_GRILL %.1f studs"):format(grill:GetFullName(), grill.ClassName, gdist or -1))
+        if gdist and gdist > 20 then
+            warn("[AutoFish] ⚠️ เตาที่เจออยู่ไกลจาก POS_GRILL มาก ตรวจพิกัดเตาอีกที")
+        end
+    else
+        warn("[AutoFish] ❌ ไม่เจอเตาเลย")
+    end
+
+    setStatus("🔥 กด MD_CookGrill")
+    if hrp then
+        for i = 1, 4 do
+            if not running then return end
+            pcall(function() hrp.CFrame = CFrame.new(P.COOK_GRILL + Vector3.new(0, 0, 1.5)) end)
+            task.wait(0.15)
+            pcall(function() hrp.CFrame = CFrame.new(P.COOK_GRILL + Vector3.new(0, 0, -1.5)) end)
+            task.wait(0.15)
+            if not grill or not grill.Parent then grill = getGrillObj() end
+            interact(grill, "MD_CookGrill")
+            task.wait(0.2)
+        end
+    end
+    task.wait(0.5)
+end
+
+local function stepCook()
+    setStatus("🚶 กลับไปรอหน้าตู้เย็น")
+    tweenWalk(P.COOK_FRIDGE, CFG.SPEED)
+    for i = CFG.WAIT_BEFORE_REMOTE, 1, -1 do
+        if not running then return end
+        setStatus(("⏳ รอหน้าตู้เย็น %d วิ ก่อนยิงรีโมท..."):format(i), Color3.fromRGB(255, 200, 80))
+        task.wait(1)
+    end
+    setStatus("🔥 Finish (ยิง MD_CookRemote)")
+    pcall(function() if CookRemote then CookRemote:FireServer("Finish") end end)
+    task.wait(0.2)
+    for _, a in ipairs({ "finish_grilling_2", "Finish", "finish" }) do
+        pcall(function() if CookRemote then CookRemote:FireServer(a) end end)
+    end
+    task.wait(0.3)
+    pcall(function()
+        if firesignal and CookRemote then firesignal(CookRemote.OnClientEvent, "Finished", "Perfect!", 160, 26) end
+        if firesignal and CashFX then firesignal(CashFX.OnClientEvent, "Pickup", 160) end
+    end)
+    task.wait(CFG.AFTER_FINISH_WAIT)
+end
+
+local function cookOnce()
+    if not shiftStarted then
+        if not stepAccept() then task.wait(1); return end
+    end
+    if not running then return end
+    stepFridge(); if not running then return end
+    stepGrill();  if not running then return end
+    stepCook()
+end
+
+--=====================================================================
+--  ATM / SHOP / SELL
+--=====================================================================
+local function goATM()
+    setStatus("🏦 ไปตู้ ATM")
+    tweenWalk(P.ATM, CFG.SPEED)
+    task.wait(0.4)
+end
+
+local function atmDeposit(amount)
+    amount = math.floor(amount)
+    if amount <= 0 then return end
+    setStatus("🏦 ฝากเงิน $" .. amount, Color3.fromRGB(150, 200, 245))
+    pcall(function() ATMRemote:FireServer("Deposit", amount) end)
+    task.wait(0.9)
+end
+
+local function atmWithdraw(amount)
+    amount = math.floor(amount)
+    if amount <= 0 then return end
+    setStatus("🏦 ถอนเงิน $" .. amount, Color3.fromRGB(150, 200, 245))
+    pcall(function() ATMRemote:FireServer("Withdraw", amount) end)
+    task.wait(0.9)
+end
+
+local function depositTrip()
+    goATM()
+    atmDeposit(getCash())
+end
+
+local function goShop()
+    setStatus("🛒 ไปร้านซื้อของตกปลา")
+    tweenWalk(P.SHOP, CFG.SPEED)
+    task.wait(0.4)
+end
+
+local function stayAtShop()
+    for i = CFG.SHOP_WAIT, 1, -1 do
+        if not (running or manualTest) or not alive() then return end
+        setStatus(("🛒 ยืนรอที่ร้าน %d วิ ก่อนซื้อ..."):format(i), Color3.fromRGB(255, 200, 80))
+        task.wait(1)
+    end
+end
+
+local function equipRod()
+    if heldRod() then return true end
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local tool = findTool(function(t) return t.Name == CFG.ROD_ID end)
+    if not tool or not char or not hum then return false end
+    setStatus("🎣 ถือเบ็ด")
+    if tool.Parent ~= char then
+        pcall(function() hum:EquipTool(tool) end)
+        task.wait(0.4)
+    end
+    pcall(function() RentalRemote:FireServer("EquipFarm", char:FindFirstChild(CFG.ROD_ID) or tool) end)
+    task.wait(0.4)
+    if not heldRod() then
+        pcall(function() ItemsEvent:FireServer("SelectSlot", CFG.ROD_SLOT) end)
+        task.wait(0.5)
+    end
+    return heldRod()
+end
+
+local rodFailStreak = 0
+local function ensureRodHeld()
+    for _ = 1, 3 do
+        if heldRod() then rodFailStreak = 0; return true end
+        equipRod()
+        if heldRod() then rodFailStreak = 0; return true end
+        task.wait(0.5)
+    end
+    rodFailStreak = rodFailStreak + 1
+    return false
+end
+
+local function tryBuyRod()
+    for attempt = 1, 4 do
+        if not (running or manualTest) or not alive() then return false end
+        local before = getCash()
+        setStatus(("🛒 ซื้อเบ็ด (ครั้งที่ %d/4)"):format(attempt))
+        pcall(function() RentalRemote:FireServer("BuyFishing", CFG.ROD_ID) end)
+        task.wait(1.5)
+        if hasRod() or getCash() <= before - 1000 then return true end
+        setStatus("⏳ server ให้รอที่ร้านเพิ่ม...", Color3.fromRGB(255, 200, 80))
+        task.wait(3)
+    end
+    return false
+end
+
+local function buyRodAndBait()
+    if getCash() < CFG.TARGET_MONEY then
+        goATM()
+        local cash = getCash()
+        if cash > 0 then atmDeposit(cash) end
+        if getBank() < CFG.TARGET_MONEY then
+            setStatus("⚠️ เงินในธนาคารไม่ถึง " .. CFG.TARGET_MONEY, Color3.fromRGB(255, 180, 100))
+            task.wait(2)
+            return
+        end
+        atmWithdraw(CFG.TARGET_MONEY)
+    end
+
+    goShop()
+    stayAtShop()
+    if not hasRod() then
+        if not tryBuyRod() then
+            setStatus("⚠️ ซื้อเบ็ดไม่สำเร็จ ดู Console (F9) แล้วลองใหม่", Color3.fromRGB(255, 180, 100))
+            task.wait(2)
+            return
+        end
+    end
+    rodOwned = true
+    notify("✅ ได้เบ็ดแล้ว", "ตรวจเหยื่อและเริ่มฟามเลเวล", 3)
+
+    local have = getBaitCount()
+    local want = CFG.BAIT_COUNT - have
+    if want > 0 then
+        local canBuy = math.min(want, math.floor(getCash() / CFG.BAIT_PRICE))
+        if canBuy > 0 then
+            setStatus(("🛒 ซื้อเหยื่อ %d อัน (มี %d)"):format(canBuy, have))
+            pcall(function() RentalRemote:FireServer("BuyFishing", CFG.BAIT_ID, canBuy) end)
+            task.wait(1.5)
+        end
+    else
+        setStatus(("🪱 มีเหยื่อ %d อัน พอแล้ว ไม่ซื้อเพิ่ม"):format(have))
+    end
+
+    needSell = true
+end
+
+local function sellFish()
+    setStatus("🐟 ไปขายปลา")
+    tweenWalk(P.SELL, CFG.SPEED)
+    task.wait(0.4)
+    for i = CFG.SELL_WAIT, 1, -1 do
+        if not running or not alive() then return false end
+        setStatus(("🐟 ยืนรอที่จุดขาย %d วิ ก่อนขาย..."):format(i), Color3.fromRGB(255, 200, 80))
+        task.wait(1)
+    end
+    setStatus("🐟 ขายปลาทั้งหมด")
+    pcall(function() FishingRemote:FireServer("SellAll") end)
+    task.wait(1.5)
+    return true
+end
+
+local function baitAffordable()
+    local missing = CFG.BAIT_COUNT - getBaitCount()
+    return math.min(missing, math.floor(totalMoney() / CFG.BAIT_PRICE))
+end
+
+local function buyBait(n)
+    if getBaitCount() >= CFG.BAIT_COUNT then
+        setStatus("🪱 เหยื่อพอแล้ว ไม่ซื้อเพิ่ม")
+        needSell = true
+        return
+    end
+    goATM()
+    local need = n * CFG.BAIT_PRICE
+    local cash = getCash()
+    if cash > need then
+        atmDeposit(cash - need)
+    elseif cash < need then
+        atmWithdraw(need - cash)
+    end
+    goShop()
+    stayAtShop()
+    setStatus("🛒 ซื้อเหยื่อ " .. n .. " อัน")
+    pcall(function() RentalRemote:FireServer("BuyFishing", CFG.BAIT_ID, n) end)
+    task.wait(1.5)
+
+    if getBaitCount() <= 0 then
+        baitFailCount = baitFailCount + 1
+        warn("[AutoFish] ซื้อเหยื่อแล้วแต่นับเหยื่อไม่เจอ (" .. baitFailCount .. ")")
+        if baitFailCount >= 2 then
+            running = false
+            notify("⚠️ หยุดเพื่อความปลอดภัย", "นับเหยื่อในตัวไม่เจอ ระบบหยุดเพื่อความปลอดภัย", 8)
+            setStatus("⛔ นับเหยื่อไม่เจอ หยุดทำงาน", Color3.fromRGB(255, 100, 100))
+        end
+    else
+        baitFailCount = 0
+    end
+    needSell = true
+end
+
+--=====================================================================
+--  FISHING
+--=====================================================================
+local function getServerTime()
+    local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
+    if ok and typeof(t) == "number" then return t end
+    return tick()
+end
+
+local function computeReelTime(data, minDelay)
+    minDelay = minDelay or 0.15
+    local now = getServerTime()
+    local n = math.ceil((now + minDelay - data.start) / data.period - data.center)
+    if n < 0 then n = 0 end
+    return data.start + (data.center + n) * data.period
+end
+
+local function fishRound(zone)
+    local required, reelsSent = nil, 0
+    local lastActivity = tick()
+    local active = true
+    local startT = tick()
+
+    local conn = FishingRemote.OnClientEvent:Connect(function(...)
+        if not running or not active then return end
+        local args = { ... }
+        local ev = args[1]
+        if ev == "Bite" then
+            local data = args[2]
+            if type(data) ~= "table" then return end
+            required = data.required
+            lastActivity = tick()
+            setStatus(string.format("🎣 Bite! รอบ %s/%s", tostring(data.round), tostring(required)), Color3.fromRGB(255, 220, 100))
+            local targetTime = computeReelTime(data, 0.15)
+            task.spawn(function()
+                local waitSec = targetTime - getServerTime()
+                if waitSec > 0 then task.wait(waitSec) end
+                if not (running and active) then return end
+                FishingRemote:FireServer("Reel", { at = getServerTime(), round = data.round })
+                reelsSent = reelsSent + 1
+                setStatus(string.format("🎣 ส่ง Reel (%d/%d)", reelsSent, required or 0), Color3.fromRGB(120, 220, 120))
+            end)
+        elseif ev == "Wait" then
+            lastActivity = tick()
+        end
+    end)
+
+    setStatus("🎣 เหวี่ยงเบ็ด (" .. zone.name .. ")", Color3.fromRGB(255, 220, 100))
+    FishingRemote:FireServer("Cast", zone.cast)
+
+    local success = false
+    local lostAt = nil
+    while running and alive() and active do
+        task.wait(0.25)
+        if not heldRod() then
+            lostAt = lostAt or tick()
+            if tick() - lostAt > 2 then break end
+        else
+            lostAt = nil
+        end
+        if required and reelsSent >= required then
+            task.wait(0.6)
+            success = true
+            break
+        end
+        if tick() - lastActivity > 12 then break end
+    end
+    active = false
+    conn:Disconnect()
+
+    if success then
+        catchCount = catchCount + 1
+        setStatus(string.format("🐟 ได้ปลา! (%d) ใช้เวลา %.1fs", catchCount, tick() - startT), Color3.fromRGB(120, 255, 120))
+    else
+        setStatus("⌛ หมดเวลา ลองเหวี่ยงใหม่", Color3.fromRGB(255, 180, 100))
+    end
+    task.wait(1)
+    return success
+end
+
+--=====================================================================
+--  MAIN LOGIC
+--=====================================================================
+local function step()
+    if not rodOwned then
+        if hasRod() then
+            rodOwned = true
+        elseif totalMoney() < CFG.TARGET_MONEY then
+            phase = "COOK"
+            setStatus(string.format("🍳 ฟามเงิน %d / %d", totalMoney(), CFG.TARGET_MONEY))
+            cookOnce()
+            if running and getCash() >= CFG.DEPOSIT_AT and totalMoney() < CFG.TARGET_MONEY then
+                depositTrip()
+            end
+            return
+        else
+            phase = "BUY"
+            buyRodAndBait()
+            return
+        end
+    end
+
+    if getBaitCount() <= 0 then
+        phase = "RESUPPLY"
+        if needSell then
+            if sellFish() then needSell = false else return end
+        end
+        local n = baitAffordable()
+        if n < 1 then
+            phase = "COOK"
+            setStatus("🍳 เงินไม่พอซื้อเหยื่อ ไปฟามเงิน")
+            cookOnce()
+            return
+        end
+        buyBait(n)
+        return
+    end
+
+    local zone = pickZone(getFishLevel())
+    curZone = zone
+    phase = "FISH"
+    local hrp = getHRP()
+    if not hrp then task.wait(1); return end
+    if (hrp.Position - zone.stand).Magnitude > 25 then
+        setStatus("🚶 ไป " .. zone.name)
+        tweenWalk(zone.stand, CFG.SPEED)
+        task.wait(0.4)
+    end
+    if not ensureRodHeld() and rodFailStreak < 3 then
+        setStatus("⚠️ ถือเบ็ดไม่สำเร็จ ลองใหม่", Color3.fromRGB(255, 180, 100))
+        task.wait(2)
+        return
+    end
+    fishRound(zone)
+end
+
+local function mainLoop()
+    while running and alive() do
+        local ok, err = pcall(step)
+        if not ok then
+            warn("[AutoFish] Error:", err)
+            task.wait(1)
+        end
+        task.wait(0.1)
+    end
+end
+
+--=====================================================================
+--  ANTI-SIT (กันนั่ง / กันติดเก้าอี้)
+--=====================================================================
+local antiSitEnabled = true
+local lastSitWarn = 0
+
+local function isSeat(p)
+    return p and (p:IsA("Seat") or p:IsA("VehicleSeat"))
+end
+
+local function sitWarn()
+    if tick() - lastSitWarn < 3 then return end
+    lastSitWarn = tick()
+    notify("🚫 กันนั่ง", "เซิร์ฟเวอร์นี้ไม่อนุญาตให้นั่งเก้าอี้", 2)
+end
+
+local function forceStand(character, humanoid)
+    local seat = humanoid.SeatPart
+    if seat then
+        for _, v in ipairs(seat:GetChildren()) do
+            if v:IsA("Weld") or v:IsA("Motor6D") or v:IsA("WeldConstraint") then
+                if v.Name == "SeatWeld" or v:IsA("Weld") then pcall(function() v:Destroy() end) end
+            end
+        end
+    end
+    for _, v in ipairs(character:GetChildren()) do
+        if v:IsA("Weld") or v:IsA("Motor6D") then
+            if isSeat(v.Part0) or isSeat(v.Part1) then pcall(function() v:Destroy() end) end
+        end
+    end
+    humanoid.Sit = false
+    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+end
+
+local function setupAntiSit(character)
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    if not humanoid then return end
+
+    character.ChildAdded:Connect(function(child)
+        if not antiSitEnabled or not alive() then return end
+        if child:IsA("Weld") or child:IsA("Motor6D") then
+            task.spawn(function()
+                task.wait()
+                if isSeat(child.Part0) or isSeat(child.Part1) then
+                    pcall(function() child:Destroy() end)
+                    humanoid.Sit = false
+                    sitWarn()
+                end
+            end)
+        end
+    end)
+
+    humanoid.StateChanged:Connect(function(_, newState)
+        if not antiSitEnabled or not alive() then return end
+        if newState == Enum.HumanoidStateType.Seated then
+            forceStand(character, humanoid)
+            sitWarn()
+        end
+    end)
+
+    task.spawn(function()
+        while alive() and character and character.Parent and humanoid and humanoid.Parent do
+            if antiSitEnabled and (humanoid.Sit or humanoid.SeatPart) then
+                forceStand(character, humanoid)
+                sitWarn()
+            end
+            task.wait(0.1)
+        end
+    end)
+end
+
+if player.Character then task.spawn(setupAntiSit, player.Character) end
+
+player.CharacterAdded:Connect(function(newChar)
+    if activeBeam and activeBeam.Parent then activeBeam:Destroy() end
+    if activeTween then pcall(function() activeTween:Cancel() end) end
+    shiftStarted = false
+    lastEquipTry = 0
+    if alive() then task.spawn(setupAntiSit, newChar) end
+end)
+
+--=====================================================================
+--  ANTI-AFK
+--=====================================================================
+local VirtualUser = game:GetService("VirtualUser")
+local afkPings = 0
+
+if type(getconnections) == "function" then
+    pcall(function()
+        for _, c in ipairs(getconnections(player.Idled)) do
+            pcall(function() c:Disable() end)
+        end
+    end)
+end
+
+player.Idled:Connect(function()
+    if not alive() then return end
+    afkPings = afkPings + 1
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+end)
+
+task.spawn(function()
+    while alive() do
+        task.wait(240)
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            VirtualUser:CaptureController()
+            VirtualUser:Button2Down(Vector2.new(0, 0), cam and cam.CFrame or CFrame.new())
+            task.wait(0.1)
+            VirtualUser:Button2Up(Vector2.new(0, 0), cam and cam.CFrame or CFrame.new())
+        end)
+        afkPings = afkPings + 1
+    end
+end)
+
+--=====================================================================
+--  DASHBOARD UI
+--=====================================================================
+local Lighting = game:GetService("Lighting")
+
+local function getFishCount()
+    local n = 0
+    for _, container in ipairs({ player:FindFirstChildOfClass("Backpack"), player.Character }) do
+        if container then
+            for _, t in ipairs(container:GetChildren()) do
+                if t:IsA("Tool")
+                    and t:GetAttribute("MD_FarmItem") == true
+                    and t.Name ~= CFG.ROD_ID
+                    and not t.Name:lower():find(CFG.BAIT_MATCH, 1, true) then
+                    n = n + (tonumber(t:GetAttribute("MD_StackCount")) or 1)
+                end
+            end
+        end
+    end
+    return n
+end
+
+local function fmt(n)
+    local str = tostring(math.floor(n))
+    local left, num, right = str:match("^([^%d]*%d)(%d*)(.-)$")
+    if not left then return str end
+    local rev = num:reverse():gsub("(%d%d%d)", "%1,")
+    return left .. rev:reverse() .. right
+end
+
+local function mk(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+local function corner(o, r) return mk("UICorner", { CornerRadius = UDim.new(0, r) }, o) end
+
+local C = {
+    BG     = Color3.fromRGB(14, 19, 31),
+    CARD   = Color3.fromRGB(26, 34, 52),
+    TRACK  = Color3.fromRGB(10, 14, 24),
+    TEXT   = Color3.fromRGB(235, 242, 253),
+    MUTED  = Color3.fromRGB(140, 158, 188),
+    ACCENT = Color3.fromRGB(90, 180, 255),
+    GREEN  = Color3.fromRGB(120, 230, 150),
+    BLUE   = Color3.fromRGB(130, 195, 250),
+    ORANGE = Color3.fromRGB(250, 180, 100),
+    CYAN   = Color3.fromRGB(100, 220, 235),
+    GOLD   = Color3.fromRGB(255, 208, 90),
+    RED    = Color3.fromRGB(215, 75, 75),
+}
+
+local PHASES = {
+    IDLE     = { "💤 รอเริ่มงาน",          C.MUTED  },
+    COOK     = { "🍳 ฟามเงิน (ทำสเต็ก)",   C.ORANGE },
+    BUY      = { "🛒 ซื้อเบ็ด / เหยื่อ",    C.GOLD   },
+    RESUPPLY = { "🔄 เติมเหยื่อ / ขายปลา",  C.BLUE   },
+    FISH     = { "🎣 ตกปลา",               C.CYAN   },
+}
+
+for _, o in ipairs(Lighting:GetChildren()) do
+    if o.Name == "AutoFishBlur" then o:Destroy() end
+end
+local blur
+pcall(function() blur = mk("BlurEffect", { Name = "AutoFishBlur", Size = 16 }, Lighting) end)
+
+local gui = mk("ScreenGui", {
+    Name = "AutoFishDashboard", ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 1000, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, player:WaitForChild("PlayerGui"))
+
+local overlay = mk("Frame", {
+    Name = "Overlay", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1),
+    BackgroundTransparency = 0.2, BorderSizePixel = 0, Active = true,
+}, gui)
+mk("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(16, 26, 46), Color3.fromRGB(4, 7, 14)), Rotation = 90,
+}, overlay)
+
+local panel = mk("Frame", {
+    Name = "Panel", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromScale(0.92, 0.84), BackgroundColor3 = C.BG, BackgroundTransparency = 0.3, BorderSizePixel = 0,
+}, overlay)
+corner(panel, 22)
+mk("UISizeConstraint", { MaxSize = Vector2.new(800, 380), MinSize = Vector2.new(300, 190) }, panel)
+local mainStroke = mk("UIStroke", { Color = C.ACCENT, Thickness = 1.8, Transparency = 0.25 }, panel)
+mk("UIPadding", {
+    PaddingTop = UDim.new(0, 14), PaddingBottom = UDim.new(0, 14),
+    PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16),
+}, panel)
+
+local function card(parent, order, size)
+    local f = mk("Frame", { LayoutOrder = order, Size = size, BackgroundColor3 = C.CARD, BackgroundTransparency = 0.25, BorderSizePixel = 0 }, parent)
+    corner(f, 12)
+    return f
+end
+
+local left = mk("Frame", { Size = UDim2.new(0.27, 0, 1, 0), BackgroundTransparency = 1 }, panel)
+mk("UIListLayout", {
+    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5),
+    HorizontalAlignment = Enum.HorizontalAlignment.Center, VerticalAlignment = Enum.VerticalAlignment.Center,
+}, left)
+
+local avatar = mk("ImageLabel", {
+    LayoutOrder = 1, Size = UDim2.fromOffset(88, 88), BackgroundColor3 = C.CARD, BorderSizePixel = 0, Image = "",
+}, left)
+corner(avatar, 44)
+local avatarStroke = mk("UIStroke", { Color = C.ACCENT, Thickness = 2.5, Transparency = 0.05 }, avatar)
+
+task.spawn(function()
+    local ok, img = pcall(function()
+        return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.AvatarBust, Enum.ThumbnailSize.Size150x150)
+    end)
+    if not ok or not img then
+        ok, img = pcall(function()
+            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+        end)
+    end
+    if ok and img then avatar.Image = img end
+end)
+
+mk("TextLabel", {
+    LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
+    Text = player.DisplayName, TextColor3 = C.TEXT, Font = Enum.Font.GothamBold, TextSize = 16,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, left)
+mk("TextLabel", {
+    LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+    Text = "@" .. player.Name, TextColor3 = C.MUTED, Font = Enum.Font.Gotham, TextSize = 11,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, left)
+
+local badge = mk("Frame", { LayoutOrder = 4, Size = UDim2.fromOffset(128, 24), BackgroundColor3 = C.CARD, BackgroundTransparency = 0.2, BorderSizePixel = 0 }, left)
+corner(badge, 12)
+local badgeText = mk("TextLabel", {
+    Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "🎣 Fishing Lv 1",
+    TextColor3 = C.GOLD, Font = Enum.Font.GothamBold, TextSize = 12,
+}, badge)
+
+local uptimeLabel = mk("TextLabel", {
+    LayoutOrder = 5, Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Text = "⏱ 00:00:00",
+    TextColor3 = C.MUTED, Font = Enum.Font.GothamMedium, TextSize = 12,
+}, left)
+local afkLabel = mk("TextLabel", {
+    LayoutOrder = 6, Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Text = "🛡 Anti-AFK: ON",
+    TextColor3 = C.GREEN, Font = Enum.Font.GothamMedium, TextSize = 11,
+}, left)
+
+local right = mk("Frame", { Position = UDim2.new(0.29, 0, 0, 0), Size = UDim2.new(0.71, 0, 1, 0), BackgroundTransparency = 1 }, panel)
+mk("UIListLayout", {
+    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Center,
+}, right)
+
+local statusCard = card(right, 1, UDim2.new(1, 0, 0.26, 0))
+local dot = mk("Frame", { Position = UDim2.fromOffset(12, 11), Size = UDim2.fromOffset(10, 10), BackgroundColor3 = C.MUTED, BorderSizePixel = 0 }, statusCard)
+corner(dot, 5)
+TweenService:Create(dot, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { BackgroundTransparency = 0.65 }):Play()
+local phaseLabel = mk("TextLabel", {
+    Position = UDim2.fromOffset(28, 4), Size = UDim2.new(1, -40, 0, 18), BackgroundTransparency = 1,
+    Text = "💤 รอเริ่มงาน", TextColor3 = C.MUTED, Font = Enum.Font.GothamBold, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, statusCard)
+local statusLabel = mk("TextLabel", {
+    Position = UDim2.fromOffset(12, 24), Size = UDim2.new(1, -24, 1, -28), BackgroundTransparency = 1,
+    Text = "เริ่มระบบ...", TextColor3 = C.TEXT, Font = Enum.Font.GothamMedium, TextSize = 13,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+}, statusCard)
+
+local bars = mk("Frame", { LayoutOrder = 2, Size = UDim2.new(1, 0, 0.17, 0), BackgroundTransparency = 1 }, right)
+mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, bars)
+
+local function makeBar(order, title, color)
+    local c = card(bars, order, UDim2.new(0.5, -4, 1, 0))
+    mk("TextLabel", {
+        Position = UDim2.fromOffset(10, 4), Size = UDim2.new(0.55, 0, 0, 14), BackgroundTransparency = 1,
+        Text = title, TextColor3 = C.MUTED, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, c)
+    local val = mk("TextLabel", {
+        Position = UDim2.new(0.4, 0, 0, 4), Size = UDim2.new(0.6, -10, 0, 14), BackgroundTransparency = 1,
+        Text = "-", TextColor3 = C.TEXT, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, c)
+    local track = mk("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 10, 1, -8), Size = UDim2.new(1, -20, 0, 6), BackgroundColor3 = C.TRACK, BorderSizePixel = 0 }, c)
+    corner(track, 3)
+    local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = color, BorderSizePixel = 0 }, track)
+    corner(fill, 3)
+    return function(text, ratio)
+        val.Text = text
+        TweenService:Create(fill, TweenInfo.new(0.4, Enum.EasingStyle.Quad), { Size = UDim2.new(math.clamp(ratio, 0, 1), 0, 1, 0) }):Play()
+    end
+end
+local setMoneyBar = makeBar(1, "💰 เป้าหมายซื้อเบ็ด", C.GOLD)
+local setBaitBar  = makeBar(2, "🪱 เหยื่อ", C.ORANGE)
+
+local grid = mk("Frame", { LayoutOrder = 3, Size = UDim2.new(1, 0, 0.37, 0), BackgroundTransparency = 1 }, right)
+mk("UIGridLayout", {
+    CellSize = UDim2.new(1 / 3, -6, 0.5, -4), CellPadding = UDim2.fromOffset(8, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+}, grid)
+
+local function makeStat(order, title, color)
+    local c = card(grid, order, UDim2.new())
+    mk("TextLabel", {
+        Position = UDim2.fromOffset(10, 3), Size = UDim2.new(1, -20, 0, 14), BackgroundTransparency = 1,
+        Text = title, TextColor3 = C.MUTED, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, c)
+    local v = mk("TextLabel", {
+        Position = UDim2.fromOffset(10, 17), Size = UDim2.new(1, -20, 1, -19), BackgroundTransparency = 1,
+        Text = "-", TextColor3 = color, Font = Enum.Font.GothamBold, TextScaled = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, c)
+    mk("UITextSizeConstraint", { MaxTextSize = 22, MinTextSize = 10 }, v)
+    return v
+end
+local vCash  = makeStat(1, "💵 เงินสดในตัว", C.GREEN)
+local vBank  = makeStat(2, "🏦 เงินธนาคาร", C.BLUE)
+local vBait  = makeStat(3, "🪱 เหยื่อในตัว", C.ORANGE)
+local vFish  = makeStat(4, "🐟 ปลาในตัว", C.CYAN)
+local vLevel = makeStat(5, "🎣 เลเวลตกปลา", C.GOLD)
+local vCatch = makeStat(6, "✅ ตกได้รอบนี้", C.GREEN)
+
+local cfgCard = card(right, 4, UDim2.new(1, 0, 0.09, 0))
+local cfgLabel = mk("TextLabel", {
+    Size = UDim2.new(1, -16, 1, 0), Position = UDim2.fromOffset(8, 0), BackgroundTransparency = 1,
+    Text = "", TextColor3 = C.MUTED, Font = Enum.Font.Gotham, TextScaled = true,
+}, cfgCard)
+mk("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 8 }, cfgLabel)
+
+local ctrl = mk("Frame", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 12), Size = UDim2.fromOffset(84, 38),
+    BackgroundTransparency = 1,
+}, gui)
+mk("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8),
+    HorizontalAlignment = Enum.HorizontalAlignment.Right, SortOrder = Enum.SortOrder.LayoutOrder,
+}, ctrl)
+
+local function smallBtn(order, text)
+    local b = mk("TextButton", {
+        LayoutOrder = order, Size = UDim2.fromOffset(38, 38), BackgroundColor3 = C.CARD, BackgroundTransparency = 0.25,
+        BorderSizePixel = 0, Text = text, TextColor3 = C.TEXT, Font = Enum.Font.GothamBold, TextSize = 16,
+    }, ctrl)
+    corner(b, 19)
+    return b
+end
+local hideBtn  = smallBtn(1, "👁")
+local pauseBtn = smallBtn(2, "⏸")
+
+local overlayShown = true
+hideBtn.MouseButton1Click:Connect(function()
+    overlayShown = not overlayShown
+    overlay.Visible = overlayShown
+    if blur then blur.Enabled = overlayShown end
+    hideBtn.Text = overlayShown and "👁" or "🙈"
+end)
+
+local toast = mk("TextLabel", {
+    AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -14), Size = UDim2.fromOffset(0, 0),
+    AutomaticSize = Enum.AutomaticSize.XY, BackgroundColor3 = C.CARD, BackgroundTransparency = 0.15, BorderSizePixel = 0,
+    Text = "", TextColor3 = C.ACCENT, Font = Enum.Font.GothamMedium, TextSize = 13, Visible = false,
+}, overlay)
+corner(toast, 12)
+mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }, toast)
+local toastId = 0
+toastFn = function(title, content, dur)
+    toastId = toastId + 1
+    local id = toastId
+    toast.Text = tostring(title) .. "  " .. tostring(content)
+    toast.Visible = true
+    task.delay(dur or 3, function()
+        if toastId == id then toast.Visible = false end
+    end)
+end
+
+statusSetter = function(text, color)
+    statusLabel.Text = text
+    dot.BackgroundColor3 = color or C.MUTED
+end
+
+local function setRunning(state)
+    running = state and true or false
+    if running then
+        if not loopActive then
+            loopActive = true
+            task.spawn(function() pcall(mainLoop); loopActive = false end)
+        end
+    else
+        if activeTween then pcall(function() activeTween:Cancel() end) end
+        if activeBeam and activeBeam.Parent then activeBeam:Destroy() end
+        setStatus("⏸ หยุดชั่วคราว", C.MUTED)
+    end
+end
+pauseBtn.MouseButton1Click:Connect(function() setRunning(not running) end)
+
+local startClock = os.time()
+
+local function refresh()
+    local cash, bank, bait = getCash(), getBank(), getBaitCount()
+    local lv = getFishLevel()
+
+    vCash.Text  = "$" .. fmt(cash)
+    vBank.Text  = "$" .. fmt(bank)
+    vBait.Text  = tostring(bait)
+    vFish.Text  = tostring(getFishCount())
+    vLevel.Text = "Lv " .. lv
+    vCatch.Text = tostring(catchCount)
+    badgeText.Text = "🎣 Fishing Lv " .. lv
+
+    if rodOwned or hasRod() then
+        setMoneyBar("✅ ได้เบ็ดแล้ว", 1)
+    else
+        local total = cash + bank
+        local ratio = total / math.max(CFG.TARGET_MONEY, 1)
+        setMoneyBar(("$%s / $%s"):format(fmt(total), fmt(CFG.TARGET_MONEY)), ratio)
+    end
+    setBaitBar(("%d / %d"):format(bait, CFG.BAIT_COUNT), bait / math.max(CFG.BAIT_COUNT, 1))
+
+    local info = PHASES[phase] or PHASES.IDLE
+    local text, color = info[1], info[2]
+    if not running then
+        text, color = "⏸ หยุดชั่วคราว", C.MUTED
+    elseif phase == "FISH" and curZone then
+        text = "🎣 ตกปลา · " .. curZone.name
+    end
+    phaseLabel.Text = text
+    phaseLabel.TextColor3 = color
+    mainStroke.Color = color
+    avatarStroke.Color = color
+    pauseBtn.Text = running and "⏸" or "▶"
+
+    cfgLabel.Text = ("⚙ เป้าหมาย $%s  •  ฝากที่ $%s  •  เหยื่อ %d  •  เดิน %d")
+        :format(fmt(CFG.TARGET_MONEY), fmt(CFG.DEPOSIT_AT), CFG.BAIT_COUNT, CFG.SPEED)
+    afkLabel.Text = afkPings > 0 and ("🛡 Anti-AFK: ON (กันแล้ว %d)"):format(afkPings) or "🛡 Anti-AFK: ON"
+    local up = os.time() - startClock
+    uptimeLabel.Text = ("⏱ %02d:%02d:%02d"):format(math.floor(up / 3600), math.floor(up / 60) % 60, up % 60)
+end
+
+task.spawn(function()
+    while alive() do
+        pcall(refresh)
+        task.wait(0.5)
+    end
+    if blur then pcall(function() blur:Destroy() end) end
+    if gui then gui:Destroy() end
+end)
+
+--=====================================================================
+--  START
+--=====================================================================
+setStatus("เริ่มระบบ...", C.ACCENT)
+setRunning(true)
+print("[AutoFishLevel] ✅ Loaded (cooking portion patched)")
