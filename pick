@@ -2,7 +2,8 @@
 --  AUTO FISH LEVEL  (Dashboard + External Config)
 --  ลำดับ: ฟามเงินด้วยสเต็ก -> ฝาก ATM -> ถอน 5500 -> ซื้อเบ็ด+เหยื่อ
 --         -> ถือเบ็ด -> ตกปลาตามเลเวล -> เหยื่อหมดไปขายปลา/ฝาก/ซื้อเหยื่อใหม่
---  [แก้ไข] ปรับปรุงส่วนฟามเงิน/สเต็กให้ตรงกับเวอร์ชันที่ฟิกบัคแล้ว
+--  เลเวล 60+: ถ้ายังไม่มีตั๋ว Palm Island -> ฟามเงินให้ครบ 2,200,000
+--             -> ถอนไปซื้อตั๋ว (ที่ร้านเดียวกับเบ็ด) -> ไปตกที่ Palm Island
 --=====================================================================
 local Players      = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -22,25 +23,42 @@ end
 --=====================================================================
 --  CONFIG
 --=====================================================================
+-- สถานะตั๋ว Palm Island (ประกาศไว้ก่อน เพราะใช้ทั้งในคอนฟิกและตัวฟังเหตุการณ์ร้าน)
+local ticketOwned    = false   -- มีตั๋วแล้ว (ซื้อถาวร จำไว้ตลอดเซสชัน)
+local ticketSource   = ""      -- รู้ได้จากอะไร: config / server / card / bag / bought
+local ticketListed   = false   -- ร้านส่งข้อมูลตั๋วมาแล้ว (รู้สถานะจริงจาก server)
+local shopEventAt    = 0       -- เวลาที่ได้รับ FishingShop ล่าสุด
+local ticketChecked  = false   -- เช็กสถานะตั๋วที่ร้านแล้ว (ทำครั้งเดียวต่อเซสชัน)
+local lastFishMsg    = ""      -- ข้อความล่าสุดที่ server ส่งมาตอนตกปลา (บอกสาเหตุที่โยนไม่ติด)
+
 local V = Vector3.new
 
 local CFG = {
-    TARGET_MONEY = 5500,
-    DEPOSIT_AT   = 600,
-    BAIT_PRICE   = 45,
-    BAIT_COUNT   = 11,
-    SPEED        = 150,
-    SPEED_ACCEPT = 50,
+    TARGET_MONEY = 5500,   -- เงินที่ต้องมีก่อนซื้อเบ็ด (ถอนครั้งเดียว)
+    DEPOSIT_AT   = 600,    -- เงินสดถึงเท่านี้ให้ไปฝาก (ตอนฟามเงิน)
+    BAIT_PRICE   = 45,     -- ราคาเหยื่อต่ออัน
+    BAIT_COUNT   = 11,     -- จำนวนเหยื่อที่ซื้อแต่ละครั้ง (ปรับได้ใน UI)
+    SPEED        = 150,    -- ความเร็วเดินทั่วไป
+    SPEED_ACCEPT = 50,     -- ความเร็วตอนไปรับงานคุก
     ROD_ID       = "FishingRodUltimate",
     BAIT_ID      = "PrawntecUltimate",
-    BAIT_MATCH   = "prawn",
+    BAIT_MATCH   = "prawn", -- ชื่อ Tool เหยื่อ (ตัวพิมพ์เล็ก) ไว้นับเหยื่อในตัว
     ROD_SLOT     = 2,
-    SELL_WAIT    = 4,
-    SHOP_WAIT    = 4,
-    WAIT_BEFORE_REMOTE = 8,
-    AFTER_FINISH_WAIT  = 3,
+    SELL_WAIT    = 4,      -- ยืนรอที่จุดขายปลากี่วิก่อนขาย
+    SHOP_WAIT    = 4,      -- ยืนรอที่ร้านกี่วิก่อนซื้อ (server บังคับให้อยู่ที่ร้านสักพัก)
+    WAIT_BEFORE_REMOTE = 6,
+    AFTER_FINISH_WAIT  = 0,
+    COOK_EXTRA         = 0.4,  -- รอเพิ่มหลังครบเวลาสุกจาก server ก่อนยิง Finish
+
+    -- ===== เลเวล 60 / Palm Island =====
+    PALM_LEVEL   = 60,                 -- เลเวลที่เริ่มซื้อตั๋ว Palm Island
+    PALM_NEED_LEVEL = false,           -- false = มีตั๋วแล้วไปตกได้เลย ไม่ต้องรอเลเวล / true = ต้องถึง PALM_LEVEL ด้วย
+    TICKET_ID    = "PalmIslandTicket", -- ชื่อไอเทมตั๋ว (ซื้อถาวรครั้งเดียว)
+    TICKET_PRICE = 2000000,            -- ราคาตั๋ว
+    TICKET_MONEY = 2200000,            -- เงินรวมที่ต้องมีก่อนไปซื้อตั๋ว (เผื่อซื้อเหยื่อ)
 }
 
+-- อ่านคอนฟิกภายนอก: getgenv().AutoFishConfig (ปรับได้เฉพาะ 4 ค่านี้ ที่เหลือใช้ค่าเดิม)
 do
     local USER = env.AutoFishConfig
     local function pick(key, lo, hi)
@@ -56,6 +74,16 @@ do
     pick("DEPOSIT_AT",   1, 100000000)
     pick("BAIT_COUNT",   1, 500)
     pick("SPEED",        16, 400)
+    pick("PALM_LEVEL",   1, 500)           -- เลเวลตกปลาที่เริ่มไป Palm Island (ปกติ 60)
+    pick("TICKET_MONEY", 1, 1000000000)    -- เงินรวมที่ต้องมีก่อนซื้อตั๋ว (ปกติ 2,200,000)
+    if type(USER) == "table" and USER.PALM_NEED_LEVEL ~= nil then
+        CFG.PALM_NEED_LEVEL = (USER.PALM_NEED_LEVEL == true)
+    end
+    -- บังคับว่ามีตั๋วแล้ว (ใช้เมื่อสคริปต์เช็กไม่เจอ แต่คุณซื้อไปแล้วจริง)
+    if type(USER) == "table" and USER.HAS_TICKET == true then
+        ticketOwned = true
+        ticketSource = "config"
+    end
 end
 
 local P = {
@@ -67,6 +95,8 @@ local P = {
     SELL        = V(-253.15, 256.08, 381.65),
 }
 
+-- โซนตกปลา (minLv = เลเวลต่ำสุดที่ใช้โซนนี้)
+-- โซน 4 (Palm Island) ต้องมีตั๋ว ถ้ายังไม่มีจะใช้โซน 3 ไปก่อน
 local ZONES = {
     { name = "โซน 1 (Lv 1-9)",  minLv = 1,
       stand = V(106.90, 243.49, -793.63),
@@ -74,10 +104,29 @@ local ZONES = {
     { name = "โซน 2 (Lv 10-24)", minLv = 10,
       stand = V(451.18, 216.17, -891.34),
       cast  = V(481.9892578125, 212.169921875, -924.13189697265625) },
-    { name = "โซน 3 (Lv 25+)",  minLv = 25,
+    { name = "โซน 3 (Lv 25-59)",  minLv = 25,
       stand = V(-431.80, 233.95, 849.43),
       cast  = V(-453.96371459960938, 229.82894897460938, 809.87103271484375) },
+    { name = "Palm Island (ตั๋ว)", minLv = 60, ticket = true,
+      stand = V(1229.23, 246.99, 955.28),
+      cast  = V(1190.9229736328125, 242.56695556640625, 978.1002197265625) },
 }
+
+-- ปรับจุดยืน/จุดโยนของ Palm Island ได้จากคอนฟิก เช่น PALM_CAST = {1280, 232, 905}
+do
+    local USER = env.AutoFishConfig
+    local function vec(t)
+        if type(t) == "table" and tonumber(t[1]) and tonumber(t[2]) and tonumber(t[3]) then
+            return V(tonumber(t[1]), tonumber(t[2]), tonumber(t[3]))
+        end
+        return nil
+    end
+    if type(USER) == "table" then
+        local palm = ZONES[#ZONES]
+        palm.stand = vec(USER.PALM_STAND) or palm.stand
+        palm.cast  = vec(USER.PALM_CAST) or palm.cast
+    end
+end
 
 --=====================================================================
 --  REMOTES
@@ -89,13 +138,42 @@ local ItemsEvent    = RS:WaitForChild("MD_ItemsEvent", 10)
 local CookRemote    = RS:WaitForChild("MD_CookRemote", 10)
 local CashFX        = RS:WaitForChild("MD_CashPickupFX", 10)
 
+-- ระบบล้มตัว: Respawn = กดเกิด, Reset = รีตัวละคร
+local DownedSystem  = RS:FindFirstChild("MD_DownedSystem") or RS:WaitForChild("MD_DownedSystem", 5)
+local RespawnRemote = DownedSystem and DownedSystem:FindFirstChild("Respawn")
+local ResetRemote   = DownedSystem and DownedSystem:FindFirstChild("Reset")
+
 if RentalRemote then
     pcall(function()
         RentalRemote.OnClientEvent:Connect(function(...)
             if not alive() then return end
+            local args = { ... }
             local parts = {}
-            for _, v in ipairs({ ... }) do table.insert(parts, tostring(v)) end
+            for i = 1, select("#", ...) do
+                local v = args[i]
+                table.insert(parts, type(v) == "table" and "{table}" or tostring(v))
+            end
             print("[AutoFish] 🏪 Rental:", table.concat(parts, " | "))
+
+            -- ร้าน Jack's Hardware ส่งรายการตกปลามาเป็น ("FishingShop", _, รายชื่อ, ข้อมูลไอเทม, จุดร้าน)
+            -- ข้อมูลไอเทมแต่ละตัวมี owned = ซื้อแล้วหรือยัง
+            -- (การ์ดใน Catalogue มีครบทุกไอเทมไม่ว่าซื้อหรือยัง การเจอการ์ดจึงไม่ได้แปลว่ามีตั๋ว)
+            if args[1] == "FishingShop" and type(args[4]) == "table" then
+                shopEventAt = tick()
+                local it = args[4][CFG.TICKET_ID]
+                if type(it) == "table" then
+                    ticketListed = true
+                    if tonumber(it.price) and tonumber(it.price) > 0 then
+                        CFG.TICKET_PRICE = math.floor(tonumber(it.price))
+                        if CFG.TICKET_MONEY < CFG.TICKET_PRICE then CFG.TICKET_MONEY = CFG.TICKET_PRICE end
+                    end
+                    if it.owned == true and not ticketOwned then
+                        ticketOwned = true
+                        ticketSource = "server"
+                        print("[AutoFish] 🎫 server ยืนยันว่ามีตั๋ว Palm Island แล้ว (owned = true)")
+                    end
+                end
+            end
         end)
     end)
 end
@@ -115,10 +193,14 @@ local catchCount   = 0
 local lastEquipTry = 0
 local baitFailCount = 0
 local manualTest = false
-local phase = "IDLE"          -- IDLE / COOK / BUY / RESUPPLY / FISH
+local rodBlind = false          -- ซื้อเบ็ดแล้ว (เงินลด) แต่หาในกระเป๋าไม่เจอ ใช้ธงแทน
+local lastSpawn = 0
+local baitBlind = 0            -- เหยื่อที่ซื้อแล้วแต่นับจากกระเป๋าไม่เจอ (ใช้นับแทน)
+local purchaseFailStreak = 0
+local timeoutStreak = 0
+local phase = "IDLE"          -- IDLE / COOK / BUY / RESUPPLY / TICKET / FISH
 local curZone = nil
 local toastFn = nil
-local lastFeedback = ""
 local hasTouchInterest = (type(firetouchinterest) == "function")
 
 --=====================================================================
@@ -181,10 +263,57 @@ local function getBaitCount()
     return n
 end
 
+-- อ่านการ์ดตั๋วในหน้าร้าน: PlayerGui.MD_HouseRentalGui.MD_JackFarmShop.Catalogue.PalmIslandTicket
+-- การ์ดมีครบทุกไอเทมที่ร้านขาย "ไม่ได้แปลว่าซื้อแล้ว" ดูจากป้ายราคาแทน:
+--   ซื้อแล้ว = "OWNED"   /  ยังไม่ซื้อ = "$ราคา" หรือ "LV xx"
+-- คืนค่า: true = ซื้อแล้ว, false = ยังไม่ซื้อ, nil = ไม่มีการ์ด (ยังไม่เคยเปิดร้านในเซสชันนี้)
+local function ticketCardState()
+    local ok, res = pcall(function()
+        local pg   = player:FindFirstChild("PlayerGui")
+        local gui  = pg and pg:FindFirstChild("MD_HouseRentalGui")
+        local shop = gui and gui:FindFirstChild("MD_JackFarmShop")
+        local cat  = shop and shop:FindFirstChild("Catalogue")
+        local card = cat and cat:FindFirstChild(CFG.TICKET_ID)
+        if not card then return nil end
+        local price = card:FindFirstChild("Price")
+        local txt = price and tostring(price.Text) or ""
+        return txt:upper():find("OWNED", 1, true) ~= nil
+    end)
+    if ok then return res end
+    return nil
+end
+
+-- เช็กตั๋วในกระเป๋า/มือ: Tool ที่ชื่อตรงกับ TICKET_ID หรือมีทั้งคำว่า palm และ ticket
+local function ticketInBag()
+    return findTool(function(t)
+        local n = t.Name:lower()
+        return n == CFG.TICKET_ID:lower() or (n:find("palm", 1, true) ~= nil and n:find("ticket", 1, true) ~= nil)
+    end) ~= nil
+end
+
+local function hasPalmTicket()
+    if ticketOwned then return true end
+    if ticketInBag() then
+        ticketOwned = true; ticketSource = "bag"
+        print("[AutoFish] 🎫 พบตั๋ว Palm Island ในกระเป๋า")
+    elseif ticketCardState() == true then
+        ticketOwned = true; ticketSource = "card"
+        print("[AutoFish] 🎫 การ์ดตั๋วในร้านขึ้นว่า OWNED")
+    end
+    return ticketOwned
+end
+
 local function pickZone(lv)
+    -- มีตั๋ว Palm Island แล้ว -> ไปตกที่ Palm Island เลย (ถ้าไม่ได้ตั้ง PALM_NEED_LEVEL)
+    if hasPalmTicket() and (not CFG.PALM_NEED_LEVEL or lv >= CFG.PALM_LEVEL) then
+        for _, zz in ipairs(ZONES) do
+            if zz.ticket then return zz end
+        end
+    end
+    -- ไม่มีตั๋ว -> เลือกโซน 1-3 ตามเลเวล
     local z = ZONES[1]
     for _, zz in ipairs(ZONES) do
-        if lv >= zz.minLv then z = zz end
+        if not zz.ticket and lv >= zz.minLv then z = zz end
     end
     return z
 end
@@ -247,56 +376,95 @@ local function tweenWalk(targetPos, speed)
 end
 
 --=====================================================================
---  COOK (ฟามเงิน)  [ปรับปรุงจากเวอร์ชันฟิกบัค]
+--  COOK (ฟามเงิน)  — ใช้ตรรกะจากสคริปต์ฟามสเต็กตัวที่เวิร์ก
 --=====================================================================
+local POS_ACCEPT = P.COOK_ACCEPT
+local POS_FRIDGE = P.COOK_FRIDGE
+local POS_GRILL  = P.COOK_GRILL
+
+local SPEED_BEFORE   = CFG.SPEED_ACCEPT
+local ACCEPT_TIMEOUT = 4      -- รอ Feedback จาก server สูงสุดกี่วิ
+
 local onAccepted
+local lastFeedback = ""
 local FEEDBACK_ACCEPT = "Shift started. Get steak from the fridge."
+
+--// ========== ฟัง Event จริงจาก server ==========
+-- Feedback "Steak ready..." = หยิบสเต็กจากตู้เย็นสำเร็จ
+-- Start (เวลา, วินาทีที่ต้องย่าง, ชื่อกระทะ) = วางสเต็กบนเตาสำเร็จ
+local steakReady   = false
+local grillStarted = false
+local grillInfo    = nil   -- { dur = วินาทีที่ต้องย่าง, name = ชื่อกระทะ, recv = tick() ตอนได้รับ }
 
 if CookRemote then
     CookRemote.OnClientEvent:Connect(function(action, ...)
         if not alive() then return end
-        local msg = tostring(({ ... })[1] or "")
+        local args = {...}
+        local msg = tostring(args[1] or "")
         if action == "Feedback" then
             lastFeedback = msg
-            print("[AutoFish] 📢 Feedback:", msg)
+            print("[AutoCook] 📢 Feedback:", msg)
             local lower = msg:lower()
+            if lower:find("steak ready") then
+                steakReady = true
+            end
             if (lower:find("shift started") or lower:find("get steak")) and not shiftStarted then
                 shiftStarted = true
-                print("[AutoFish] ✅ shiftStarted = true (จาก server)")
+                print("[AutoCook] ✅ shiftStarted = true (จาก server)")
                 if onAccepted then onAccepted() end
             end
+        elseif action == "Start" then
+            grillInfo = {
+                dur  = tonumber(args[2]) or CFG.WAIT_BEFORE_REMOTE,
+                name = tostring(args[3] or ""),
+                recv = tick(),
+            }
+            grillStarted = true
+            print(("[AutoCook] 🔥 Start: ย่าง %s วิ (%s)"):format(tostring(grillInfo.dur), grillInfo.name))
         else
-            print("[AutoFish] 📡 OnClientEvent:", action, msg)
+            print("[AutoCook] 📡 OnClientEvent:", action, msg)
         end
     end)
 end
 
+--// ========== Object resolvers ==========
 local function resolve(...)
     local obj = workspace
-    for _, n in ipairs({ ... }) do
-        if type(n) == "number" then obj = obj:GetChildren()[n] else obj = obj:FindFirstChild(n) end
+    for _, n in ipairs({...}) do
+        if type(n) == "number" then
+            obj = obj:GetChildren()[n]
+        else
+            obj = obj:FindFirstChild(n)
+        end
         if not obj then return nil end
     end
     return obj
 end
 
 local function getShiftObj()
-    return resolve("Map", "Tiles", "ShoppingTile", "SteakHouse", "Interior", "SteakHouseBeacon", "TouchPart", "MD_CookShift")
+    return resolve("Map","Tiles","ShoppingTile","SteakHouse","Interior","SteakHouseBeacon","TouchPart","MD_CookShift")
 end
 
 local function getFridgeObj()
-    local interior = resolve("Map", "Tiles", "ShoppingTile", "SteakHouse", "Interior")
+    local interior = resolve("Map","Tiles","ShoppingTile","SteakHouse","Interior")
     if not interior then return nil end
     local fridge = interior:FindFirstChild("Fridge")
     if not fridge then return nil end
+
+    -- พาธหลัก: Interior.Fridge.Base
     local base = fridge:FindFirstChild("Base")
-    if base then return base:FindFirstChild("MD_CookFridge") or base end
+    if base then
+        return base:FindFirstChild("MD_CookFridge") or base
+    end
+
+    -- fallback: หาตามชื่อ
     for _, d in pairs(fridge:GetDescendants()) do
         if d.Name == "MD_CookFridge" then return d end
     end
     return nil
 end
 
+-- ตำแหน่งของ object ไม่ว่าจะเป็น Part / Model / Prompt
 local function objPos(obj)
     if not obj then return nil end
     if obj:IsA("BasePart") then return obj.Position end
@@ -316,32 +484,36 @@ local function objPos(obj)
     return nil
 end
 
-local function getGrillObj()
-    local interior = resolve("Map", "Tiles", "ShoppingTile", "SteakHouse", "Interior")
-    if not interior then return nil end
-    local candidates = {}
+-- เตาทั้งหมดใน Interior เรียงจากใกล้จุดยืนเตา (POS_GRILL) ไปไกล
+local function getGrillList()
+    local interior = resolve("Map","Tiles","ShoppingTile","SteakHouse","Interior")
+    local list = {}
+    if not interior then return list end
+
+    -- รวมผู้สมัครทุกเตาใน Interior (MD_CookGrill หรือ GrillArea ที่ไม่มี MD_CookGrill ข้างใน)
     for _, d in ipairs(interior:GetDescendants()) do
-        if d.Name == "MD_CookGrill" then
-            table.insert(candidates, d)
-        elseif d.Name == "GrillArea" and not d:FindFirstChild("MD_CookGrill", true) then
-            table.insert(candidates, d)
+        if d.Name == "MD_CookGrill" or (d.Name == "GrillArea" and not d:FindFirstChild("MD_CookGrill", true)) then
+            local pos = objPos(d)
+            if pos then table.insert(list, { obj = d, pos = pos, dist = (pos - POS_GRILL).Magnitude }) end
         end
     end
-    local best, bestDist
-    for _, c in ipairs(candidates) do
-        local pos = objPos(c)
-        if pos then
-            local dist = (pos - P.COOK_GRILL).Magnitude
-            if not bestDist or dist < bestDist then best, bestDist = c, dist end
-        end
-    end
-    if best then return best, bestDist end
-    local c65 = interior:GetChildren()[65]
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    return list
+end
+
+local function getGrillObj()
+    local list = getGrillList()
+    if list[1] then return list[1].obj, list[1].dist end
+
+    -- fallback: พาธที่เคยให้มา
+    local interior = resolve("Map","Tiles","ShoppingTile","SteakHouse","Interior")
+    local c65 = interior and interior:GetChildren()[65]
     local ga = c65 and c65:FindFirstChild("GrillArea")
     if ga then return ga:FindFirstChild("MD_CookGrill") or ga end
     return nil
 end
 
+--// ========== Universal interact (ใช้กับตู้เย็น/เตา) ==========
 local function prepPrompt(p)
     pcall(function()
         p.Enabled = true
@@ -353,69 +525,88 @@ end
 
 local function findTouchPart(obj)
     if obj:IsA("BasePart") then return obj end
-    if obj:IsA("Model") then return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true) end
+    if obj:IsA("Model") then
+        return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+    end
     local inner = obj:FindFirstChildWhichIsA("BasePart", true)
     if inner then return inner end
     local par = obj.Parent
     if par and par:IsA("BasePart") then return par end
-    if par and par:IsA("Model") then return par.PrimaryPart or par:FindFirstChildWhichIsA("BasePart", true) end
+    if par and par:IsA("Model") then
+        return par.PrimaryPart or par:FindFirstChildWhichIsA("BasePart", true)
+    end
     return nil
 end
 
--- ⭐ interact ที่มี label บอกว่ากดอะไร (ปรับปรุงจากเวอร์ชันฟิกบัค)
 local function interact(obj, label)
-    if not obj then
-        print("[Interact]", label or "?", "= nil")
-        return false
-    end
+    if not obj then print("[Interact]", label or "?", "= nil"); return false end
     print(("[Interact] %s → %s [%s]"):format(label or "?", obj:GetFullName(), obj.ClassName))
     local handled = false
+
     if obj:IsA("ProximityPrompt") then
-        prepPrompt(obj); pcall(fireproximityprompt, obj); handled = true
+        prepPrompt(obj)
+        pcall(fireproximityprompt, obj)
+        handled = true
     elseif obj:IsA("ClickDetector") then
-        pcall(fireclickdetector, obj); handled = true
+        pcall(fireclickdetector, obj)
+        handled = true
     elseif obj:IsA("RemoteEvent") then
-        for _, a in ipairs({ "Start", "Accept", "Begin", "Open", "Trigger" }) do
+        for _, a in ipairs({"Start","Accept","Begin","Open","Trigger"}) do
             pcall(function() obj:FireServer(a) end)
         end
         pcall(function() obj:FireServer() end)
         handled = true
     end
+
     for _, d in pairs(obj:GetDescendants()) do
         if d:IsA("ProximityPrompt") then
-            prepPrompt(d); pcall(fireproximityprompt, d); handled = true
+            prepPrompt(d)
+            pcall(fireproximityprompt, d); handled = true
         elseif d:IsA("ClickDetector") then
             pcall(fireclickdetector, d); handled = true
         end
     end
+
     if hasTouchInterest then
         local tp = findTouchPart(obj)
-        local hrp = getHRP()
-        if tp and hrp then
-            pcall(function() firetouchinterest(hrp, tp, 0) end)
-            task.wait(0.05)
-            pcall(function() firetouchinterest(hrp, tp, 1) end)
-            handled = true
+        if tp then
+            local hrp = getHRP()
+            if hrp then
+                pcall(function() firetouchinterest(hrp, tp, 0) end)
+                task.wait(0.05)
+                pcall(function() firetouchinterest(hrp, tp, 1) end)
+                handled = true
+            end
         end
     end
     return handled
 end
 
+--// ========== กดรับงาน "ครั้งเดียว" ==========
 local function pressShiftOnce()
     local obj = getShiftObj()
     if not obj then
-        print("[AutoFish] ❌ ไม่เจอ MD_CookShift")
+        print("[AutoCook] ❌ ไม่เจอ MD_CookShift")
         return false
     end
-    print(("[AutoFish] กดรับงาน → %s [%s]"):format(obj:GetFullName(), obj.ClassName))
+    print(("[AutoCook] กดรับงาน → %s [%s]"):format(obj:GetFullName(), obj.ClassName))
+
+    -- 1) ProximityPrompt
     local prompt = obj:IsA("ProximityPrompt") and obj or obj:FindFirstChildWhichIsA("ProximityPrompt", true)
     if prompt then
         pcall(function() prompt.Enabled = true end)
         pcall(fireproximityprompt, prompt)
         return true
     end
+
+    -- 2) ClickDetector
     local cd = obj:IsA("ClickDetector") and obj or obj:FindFirstChildWhichIsA("ClickDetector", true)
-    if cd then pcall(fireclickdetector, cd); return true end
+    if cd then
+        pcall(fireclickdetector, cd)
+        return true
+    end
+
+    -- 3) Touch
     local part = obj:IsA("BasePart") and obj or obj.Parent
     local hrp = getHRP()
     if hasTouchInterest and part and part:IsA("BasePart") and hrp then
@@ -424,106 +615,156 @@ local function pressShiftOnce()
         pcall(function() firetouchinterest(hrp, part, 1) end)
         return true
     end
+
     return false
 end
 
+--// ========== แจ้งเตือนเมื่อ server ตอบว่ารับงานแล้ว ==========
 onAccepted = function()
     notify("✅ รับงานสำเร็จ", FEEDBACK_ACCEPT, 3)
-    setStatus("✅ " .. FEEDBACK_ACCEPT, Color3.fromRGB(0, 255, 120))
+    setStatus("✅ " .. FEEDBACK_ACCEPT, Color3.fromRGB(0,255,120))
 end
 
+--// ========== Steps ==========
 local function stepAccept()
     if shiftStarted then return true end
-    setStatus("🚶 ไปจุดรับงาน (speed " .. CFG.SPEED_ACCEPT .. ")")
-    tweenWalk(P.COOK_ACCEPT, CFG.SPEED_ACCEPT)
+
+    setStatus("🚶 ไปจุดรับงาน (speed " .. SPEED_BEFORE .. ")")
+    tweenWalk(POS_ACCEPT, SPEED_BEFORE)
     task.wait(0.3)
+
     setStatus("🔵 กดรับงาน (ครั้งเดียว)...")
     pressShiftOnce()
+
+    -- รอ Feedback จริงจาก server
     local t = 0
-    while running and alive() and not shiftStarted and t < 4 do
-        task.wait(0.1); t = t + 0.1
+    while running and alive() and not shiftStarted and t < ACCEPT_TIMEOUT do
+        task.wait(0.1)
+        t = t + 0.1
     end
+
     if not shiftStarted then
-        setStatus("⚠️ server ยังไม่ตอบ จะลองใหม่", Color3.fromRGB(255, 200, 80))
+        setStatus("⚠️ server ยังไม่ตอบ จะลองใหม่", Color3.fromRGB(255,200,80))
     end
     return shiftStarted
 end
 
 local function stepFridge()
-    setStatus("🚶 ไปตู้เย็น")
-    tweenWalk(P.COOK_FRIDGE, CFG.SPEED)
+    steakReady = false
+    -- เดิน/วาร์ปเข้าจุดตู้เย็นเสมอ (ถ้ายืนอยู่แล้วฟังก์ชันจะแค่ snap ตำแหน่ง ไม่เสียเวลา)
+    setStatus("🚶 ไปตู้เย็น (speed " .. CFG.SPEED .. ")")
+    tweenWalk(POS_FRIDGE, CFG.SPEED)
     task.wait(0.3)
+
     setStatus("🧊 กด MD_CookFridge")
     for i = 1, 5 do
         if not running then return end
         interact(getFridgeObj(), "MD_CookFridge")
         task.wait(0.4)
+        if steakReady then break end   -- server ตอบ "Steak ready" แล้ว ไม่ต้องกดซ้ำ
     end
-    task.wait(0.4)
+    if steakReady then
+        print("[AutoCook] ✅ หยิบสเต็กแล้ว")
+    else
+        warn("[AutoCook] ⚠️ ไม่ได้รับ 'Steak ready' จาก server (ไปต่อตามเดิม)")
+    end
+    task.wait(0.2)
 end
 
 local function stepGrill()
-    setStatus("🚶 ไปเตาย่าง")
-    tweenWalk(P.COOK_GRILL, CFG.SPEED)
+    grillStarted = false
+    grillInfo = nil
+    setStatus("🚶 ไปเตาย่าง (speed " .. CFG.SPEED .. ")")
+    tweenWalk(POS_GRILL, CFG.SPEED)
     task.wait(0.3)
     local hrp = getHRP()
 
-    local grill, gdist = getGrillObj()
-    if grill then
-        print(("[AutoFish] เตาที่เลือก: %s [%s] ห่าง POS_GRILL %.1f studs"):format(grill:GetFullName(), grill.ClassName, gdist or -1))
-        if gdist and gdist > 20 then
-            warn("[AutoFish] ⚠️ เตาที่เจออยู่ไกลจาก POS_GRILL มาก ตรวจพิกัดเตาอีกที")
-        end
-    else
-        warn("[AutoFish] ❌ ไม่เจอเตาเลย")
+    -- "Take it to a free grill": ลองเตาที่ใกล้สุดก่อน ถ้า server ไม่ตอบ Start ค่อยลองเตาถัดไป (สูงสุด 3 เตา)
+    local list = getGrillList()
+    if #list == 0 then
+        local g = getGrillObj()
+        if g then list = { { obj = g, pos = POS_GRILL, dist = -1 } } else warn("[AutoCook] ❌ ไม่เจอเตาเลย") end
     end
 
     setStatus("🔥 กด MD_CookGrill")
-    if hrp then
+    for idx, entry in ipairs(list) do
+        if idx > 3 or grillStarted or not running or not hrp then break end
+        local grill = entry.obj
+        print(("[AutoCook] เตา #%d: %s [%s] ห่าง POS_GRILL %.1f studs"):format(idx, grill:GetFullName(), grill.ClassName, entry.dist))
+        local base = (idx == 1) and POS_GRILL or Vector3.new(entry.pos.X, POS_GRILL.Y, entry.pos.Z)
+
         for i = 1, 4 do
-            if not running then return end
-            pcall(function() hrp.CFrame = CFrame.new(P.COOK_GRILL + Vector3.new(0, 0, 1.5)) end)
+            if not running or grillStarted then break end
+            pcall(function() hrp.CFrame = CFrame.new(base + Vector3.new(0,0,1.5)) end)
             task.wait(0.15)
-            pcall(function() hrp.CFrame = CFrame.new(P.COOK_GRILL + Vector3.new(0, 0, -1.5)) end)
+            pcall(function() hrp.CFrame = CFrame.new(base + Vector3.new(0,0,-1.5)) end)
             task.wait(0.15)
             if not grill or not grill.Parent then grill = getGrillObj() end
             interact(grill, "MD_CookGrill")
-            task.wait(0.2)
+            task.wait(0.35)   -- รอ server ตอบ Start
         end
     end
-    task.wait(0.5)
+
+    if grillStarted then
+        print("[AutoCook] ✅ วางสเต็กบนเตาแล้ว")
+    else
+        warn("[AutoCook] ⚠️ ไม่ได้รับ Start จาก server (ใช้เวลารอสำรอง)")
+    end
+    task.wait(0.3)
 end
 
 local function stepCook()
+    -- วางสเต็กเสร็จ → ไปรอหน้าตู้เย็นทันที
     setStatus("🚶 กลับไปรอหน้าตู้เย็น")
-    tweenWalk(P.COOK_FRIDGE, CFG.SPEED)
-    for i = CFG.WAIT_BEFORE_REMOTE, 1, -1 do
-        if not running then return end
-        setStatus(("⏳ รอหน้าตู้เย็น %d วิ ก่อนยิงรีโมท..."):format(i), Color3.fromRGB(255, 200, 80))
-        task.wait(1)
+    tweenWalk(POS_FRIDGE, CFG.SPEED)
+
+    -- รอให้ครบเวลาย่างตามที่ server บอก (Start) ถ้าไม่ได้รับ ใช้ WAIT_BEFORE_REMOTE
+    local total  = grillInfo and grillInfo.dur or CFG.WAIT_BEFORE_REMOTE
+    local from   = grillInfo and grillInfo.recv or tick()
+    local target = from + total + CFG.COOK_EXTRA
+    local shown  = nil
+    while running and alive() and tick() < target do
+        local left = math.ceil(target - tick())
+        if left ~= shown then
+            shown = left
+            setStatus(("⏳ รอสเต็กสุก %d วิ ก่อนยิงรีโมท..."):format(left), Color3.fromRGB(255,200,80))
+        end
+        task.wait(0.2)
     end
+    if not running then return end
+
     setStatus("🔥 Finish (ยิง MD_CookRemote)")
     pcall(function() if CookRemote then CookRemote:FireServer("Finish") end end)
     task.wait(0.2)
-    for _, a in ipairs({ "finish_grilling_2", "Finish", "finish" }) do
+    for _, a in ipairs({"finish_grilling_2","Finish","finish"}) do
         pcall(function() if CookRemote then CookRemote:FireServer(a) end end)
     end
     task.wait(0.3)
     pcall(function()
-        if firesignal and CookRemote then firesignal(CookRemote.OnClientEvent, "Finished", "Perfect!", 160, 26) end
-        if firesignal and CashFX then firesignal(CashFX.OnClientEvent, "Pickup", 160) end
+        if firesignal and CookRemote then
+            firesignal(CookRemote.OnClientEvent, "Finished", "Perfect!", 160, 26)
+        end
+        if firesignal and CashFX then
+            firesignal(CashFX.OnClientEvent, "Pickup", 160)
+        end
     end)
     task.wait(CFG.AFTER_FINISH_WAIT)
 end
 
+-- ทำสเต็ก 1 รอบ (เหมือน 1 ลูปของ mainLoop ในสคริปต์ฟามสเต็กเดิม)
 local function cookOnce()
     if not shiftStarted then
-        if not stepAccept() then task.wait(1); return end
+        if not stepAccept() then
+            task.wait(1); return
+        end
     end
     if not running then return end
-    stepFridge(); if not running then return end
-    stepGrill();  if not running then return end
+    stepFridge()
+    if not running then return end
+    stepGrill()
+    if not running then return end
     stepCook()
+    task.wait(0.1)
 end
 
 --=====================================================================
@@ -532,7 +773,7 @@ end
 local function goATM()
     setStatus("🏦 ไปตู้ ATM")
     tweenWalk(P.ATM, CFG.SPEED)
-    task.wait(0.4)
+    task.wait(0.8)
 end
 
 local function atmDeposit(amount)
@@ -577,12 +818,15 @@ local function equipRod()
     local tool = findTool(function(t) return t.Name == CFG.ROD_ID end)
     if not tool or not char or not hum then return false end
     setStatus("🎣 ถือเบ็ด")
+    -- 1) หยิบเบ็ดเข้ามือ
     if tool.Parent ~= char then
         pcall(function() hum:EquipTool(tool) end)
         task.wait(0.4)
     end
+    -- 2) ใส่ช่องเบ็ด
     pcall(function() RentalRemote:FireServer("EquipFarm", char:FindFirstChild(CFG.ROD_ID) or tool) end)
     task.wait(0.4)
+    -- 3) ถ้ายังไม่ได้ถือ เลือกช่อง 2 (ไม่ยิงถ้าถืออยู่แล้ว กันสลับเก็บ)
     if not heldRod() then
         pcall(function() ItemsEvent:FireServer("SelectSlot", CFG.ROD_SLOT) end)
         task.wait(0.5)
@@ -609,52 +853,204 @@ local function tryBuyRod()
         setStatus(("🛒 ซื้อเบ็ด (ครั้งที่ %d/4)"):format(attempt))
         pcall(function() RentalRemote:FireServer("BuyFishing", CFG.ROD_ID) end)
         task.wait(1.5)
+        -- สำเร็จถ้าเจอเบ็ดในตัว หรือเงินสดลดลงเยอะ (ราคาเบ็ด)
         if hasRod() or getCash() <= before - 1000 then return true end
+        -- ยังไม่ผ่าน: ยืนที่เดิมต่ออีกหน่อย (ห้ามขยับ เดี๋ยวเวลายืนรอรีเซ็ต) แล้วลองใหม่
         setStatus("⏳ server ให้รอที่ร้านเพิ่ม...", Color3.fromRGB(255, 200, 80))
         task.wait(3)
     end
     return false
 end
 
-local function buyRodAndBait()
-    if getCash() < CFG.TARGET_MONEY then
-        goATM()
+--=====================================================================
+--  ตัวช่วยตรวจผล / รีเช็กสถานะ (กันซื้อก่อนถอนเสร็จ และไม่หยุดเองเมื่อซื้อไม่ได้)
+--=====================================================================
+local function waitFor(cond, timeout)
+    local t = 0
+    while t < timeout do
+        if not alive() then return false end
+        if cond() then return true end
+        task.wait(0.25); t = t + 0.25
+    end
+    return cond()
+end
+
+-- ถอนเงินจนเงินสดถึง target จริง (ตรวจจากเงินสดที่เพิ่ม ไม่ใช่แค่ยิง remote)
+local function ensureCash(target)
+    for attempt = 1, 4 do
         local cash = getCash()
-        if cash > 0 then atmDeposit(cash) end
-        if getBank() < CFG.TARGET_MONEY then
-            setStatus("⚠️ เงินในธนาคารไม่ถึง " .. CFG.TARGET_MONEY, Color3.fromRGB(255, 180, 100))
-            task.wait(2)
-            return
+        if cash >= target then return true end
+        local need = target - cash
+        if getBank() < need then
+            warn(("[AutoFish] ธนาคารมี $%d ไม่พอถอน $%d"):format(getBank(), need))
+            return false
         end
-        atmWithdraw(CFG.TARGET_MONEY)
+        setStatus(("🏦 ถอนเงิน $%d (ครั้งที่ %d/4)"):format(need, attempt), Color3.fromRGB(150, 200, 245))
+        pcall(function() ATMRemote:FireServer("Withdraw", need) end)
+        if waitFor(function() return getCash() >= target end, 4) then
+            print("[AutoFish] ✅ ถอนเงินสำเร็จ เงินสด =", getCash())
+            return true
+        end
+        warn("[AutoFish] ⚠️ ถอนแล้วเงินสดยังไม่เพิ่ม ลองใหม่")
+    end
+    return getCash() >= target
+end
+
+-- เหยื่อที่ใช้ตัดสินใจ: ถ้านับจากกระเป๋าไม่เจอ แต่เงินลดจริง ใช้จำนวนที่ซื้อแทน
+local function getEffectiveBait()
+    local real = getBaitCount()
+    if real > 0 then baitBlind = 0; return real end
+    return baitBlind
+end
+
+-- รีเช็ก: ซิงก์กระเป๋า อ่านเงิน/เหยื่อ/เบ็ดใหม่ แล้วค่อยให้ลูปตัดสินใจต่อ
+local function resyncState(reason, extraWait)
+    setStatus("🔄 รีเช็กสถานะ: " .. reason, Color3.fromRGB(255, 200, 80))
+    pcall(function() ItemsEvent:FireServer("Sync") end)
+    task.wait(2)
+    if hasRod() then rodOwned = true end
+    baitFailCount = 0
+    rodFailStreak = 0
+    print(("[AutoFish] 🔎 เช็ก: เงินสด=%d ธนาคาร=%d เหยื่อ=%d มีเบ็ด=%s ถือเบ็ด=%s")
+        :format(getCash(), getBank(), getBaitCount(), tostring(hasRod()), tostring(heldRod() and true or false)))
+    notify("🔄 รีเช็กสถานะ", reason, 3)
+    if extraWait and extraWait > 0 then
+        for i = extraWait, 1, -1 do
+            if not (running or manualTest) or not alive() then return end
+            task.wait(1)
+        end
+    end
+end
+
+local function printCheck(tag)
+    print(("[AutoFish] 🔎 [%s] เงินสด=%d ธนาคาร=%d เหยื่อ=%d มีเบ็ด=%s ถือเบ็ด=%s ตั๋ว=%s")
+        :format(tag, getCash(), getBank(), getBaitCount(), tostring(hasRod()), tostring(heldRod() and true or false), tostring(hasPalmTicket())))
+end
+
+-- ฝากเงินสดเข้าธนาคารก่อน (กันเงินหาย) แล้วรีตัวละครด้วยรีโมทของเกม
+local function resetCharacter(reason)
+    setStatus("♻️ " .. reason .. " → ฝากเงินแล้วรีตัวละคร", Color3.fromRGB(255, 160, 100))
+    local cash = getCash()
+    if cash > 0 then
+        goATM()
+        atmDeposit(cash)
+        waitFor(function() return getCash() < cash end, 3)
     end
 
-    goShop()
-    stayAtShop()
-    if not hasRod() then
-        if not tryBuyRod() then
-            setStatus("⚠️ ซื้อเบ็ดไม่สำเร็จ ดู Console (F9) แล้วลองใหม่", Color3.fromRGB(255, 180, 100))
-            task.wait(2)
+    local old = player.Character
+    local function respawned()
+        local c = player.Character
+        return c and c ~= old and c:FindFirstChild("HumanoidRootPart") ~= nil
+    end
+
+    -- 1) รีตัว (MD_DownedSystem.Reset) ถ้าไม่มีรีโมทใช้ Health = 0
+    if ResetRemote then
+        pcall(function() ResetRemote:FireServer() end)
+    else
+        local hum = old and old:FindFirstChildOfClass("Humanoid")
+        if hum then pcall(function() hum.Health = 0 end) end
+    end
+
+    -- 2) กดเกิด (MD_DownedSystem.Respawn) ย้ำเป็นระยะจนกว่าจะเกิดใหม่
+    local t = 0
+    while t < 20 and alive() and not respawned() do
+        task.wait(0.5); t = t + 0.5
+        if RespawnRemote and (t == 1.5 or t == 4 or t == 8 or t == 12) then
+            pcall(function() RespawnRemote:FireServer() end)
+        end
+        if t == 6 and not respawned() then
+            local c = player.Character
+            local hum = c and c:FindFirstChildOfClass("Humanoid")
+            if hum then pcall(function() hum.Health = 0 end) end
+        end
+    end
+    lastSpawn = tick()
+    task.wait(2)
+end
+
+-- ซื้อไม่สำเร็จ: ขยายเวลายืนรอที่ร้าน, ครบ 2 ครั้งติดรีตัวละคร, แล้วรีเช็กสถานะ (ไม่หยุดทำงาน)
+local function failPurchase(reason)
+    purchaseFailStreak = purchaseFailStreak + 1
+    local streak = purchaseFailStreak
+    CFG.SHOP_WAIT = math.min(CFG.SHOP_WAIT + 1, 10)
+    warn(("[AutoFish] ❌ %s (ครั้งที่ %d) ยืนรอที่ร้านเพิ่มเป็น %d วิ"):format(reason, streak, CFG.SHOP_WAIT))
+    if streak >= 2 then
+        purchaseFailStreak = 0
+        resetCharacter(reason)
+    end
+    resyncState(reason, math.min(3 * streak, 15))
+end
+
+-- ยิงซื้อเหยื่อ (ต้องยืนที่ร้านแล้ว) คืน true ถ้าซื้อสำเร็จจริง
+local function buyBaitAtShop(n)
+    local cashBefore = getCash()
+    local baitBefore = getBaitCount()
+    setStatus(("🛒 ซื้อเหยื่อ %d อัน (มี %d)"):format(n, baitBefore))
+    pcall(function() RentalRemote:FireServer("BuyFishing", CFG.BAIT_ID, n) end)
+
+    -- รอให้เหยื่อเข้ากระเป๋า (สูงสุด 5 วิ)
+    if waitFor(function() return getBaitCount() > baitBefore end, 5) then
+        baitBlind = 0
+        return true
+    end
+    -- เหยื่อไม่เพิ่ม: ดูว่าเงินลดไหม
+    if cashBefore - getCash() >= CFG.BAIT_PRICE then
+        baitBlind = n
+        warn("[AutoFish] ซื้อเหยื่อแล้ว (เงินลด) แต่นับเหยื่อในกระเป๋าไม่เจอ ใช้จำนวนที่ซื้อแทน")
+        notify("⚠️ นับเหยื่อไม่เจอ", "ใช้จำนวนที่ซื้อแทน", 5)
+        return true
+    end
+    return false
+end
+
+local function buyRodAndBait()
+    setStatus("🔎 เช็กเบ็ด / เหยื่อ / เงิน ก่อนซื้อ")
+    printCheck("ก่อนซื้อ")
+    task.wait(0.5)
+    -- 1) ถอนเงินให้เงินสดถึงเป้า และเช็กว่าถอนได้จริงก่อนไปต่อ
+    if getCash() < CFG.TARGET_MONEY and not hasRod() then
+        goATM()
+        if not ensureCash(CFG.TARGET_MONEY) then
+            resyncState("ถอนเงินไม่สำเร็จ", 3)
             return
         end
     end
+
+    -- 2) ไปร้าน ยืนรอ แล้วเช็กเงินอีกรอบก่อนซื้อ
+    goShop()
+    stayAtShop() -- server ต้องการให้ยืนที่ร้านสักพักก่อนซื้อ
+    if not hasRod() then
+        if getCash() < CFG.TARGET_MONEY then
+            resyncState("เงินสดไม่พอก่อนซื้อเบ็ด", 2)
+            return
+        end
+        if not tryBuyRod() then
+            failPurchase("ซื้อเบ็ดไม่สำเร็จ")
+            return
+        end
+    end
+    waitFor(hasRod, 3)
     rodOwned = true
+    rodBlind = not hasRod()      -- ถ้าเงินลดแต่หาเบ็ดไม่เจอ ให้เชื่อธง ไม่ซื้อซ้ำ
+    purchaseFailStreak = 0
     notify("✅ ได้เบ็ดแล้ว", "ตรวจเหยื่อและเริ่มฟามเลเวล", 3)
 
+    -- 3) ซื้อเหยื่อเฉพาะที่ขาด (ถ้ามีครบ/เกิน ไม่ซื้อ)
     local have = getBaitCount()
     local want = CFG.BAIT_COUNT - have
     if want > 0 then
         local canBuy = math.min(want, math.floor(getCash() / CFG.BAIT_PRICE))
         if canBuy > 0 then
-            setStatus(("🛒 ซื้อเหยื่อ %d อัน (มี %d)"):format(canBuy, have))
-            pcall(function() RentalRemote:FireServer("BuyFishing", CFG.BAIT_ID, canBuy) end)
-            task.wait(1.5)
+            if not buyBaitAtShop(canBuy) then
+                failPurchase("ซื้อเหยื่อไม่สำเร็จ")
+            end
         end
     else
         setStatus(("🪱 มีเหยื่อ %d อัน พอแล้ว ไม่ซื้อเพิ่ม"):format(have))
     end
 
     needSell = true
+    -- ยังไม่ถือเบ็ดตรงนี้ (เกมจะเก็บเบ็ดเอง) ไปถือตอนถึงจุดตกปลา
 end
 
 local function sellFish()
@@ -678,36 +1074,130 @@ local function baitAffordable()
 end
 
 local function buyBait(n)
+    -- มีเหยื่อครบ/เกินแล้ว ไม่ต้องซื้อ
     if getBaitCount() >= CFG.BAIT_COUNT then
         setStatus("🪱 เหยื่อพอแล้ว ไม่ซื้อเพิ่ม")
         needSell = true
         return
     end
+    setStatus("🔎 เช็กเบ็ด / เหยื่อ / เงิน ก่อนซื้อ")
+    printCheck("ก่อนซื้อเหยื่อ")
     goATM()
     local need = n * CFG.BAIT_PRICE
     local cash = getCash()
     if cash > need then
-        atmDeposit(cash - need)
+        atmDeposit(cash - need)          -- เหลือไว้ซื้อเหยื่อ ที่เหลือฝาก
     elseif cash < need then
-        atmWithdraw(need - cash)
+        if not ensureCash(need) then     -- ถอนเพิ่มแล้วเช็กว่าได้เงินจริง
+            resyncState("ถอนเงินซื้อเหยื่อไม่สำเร็จ", 3)
+            return
+        end
     end
     goShop()
     stayAtShop()
-    setStatus("🛒 ซื้อเหยื่อ " .. n .. " อัน")
-    pcall(function() RentalRemote:FireServer("BuyFishing", CFG.BAIT_ID, n) end)
-    task.wait(1.5)
-
-    if getBaitCount() <= 0 then
-        baitFailCount = baitFailCount + 1
-        warn("[AutoFish] ซื้อเหยื่อแล้วแต่นับเหยื่อไม่เจอ (" .. baitFailCount .. ")")
-        if baitFailCount >= 2 then
-            running = false
-            notify("⚠️ หยุดเพื่อความปลอดภัย", "นับเหยื่อในตัวไม่เจอ ระบบหยุดเพื่อความปลอดภัย", 8)
-            setStatus("⛔ นับเหยื่อไม่เจอ หยุดทำงาน", Color3.fromRGB(255, 100, 100))
-        end
-    else
-        baitFailCount = 0
+    if getCash() < need then
+        resyncState("เงินสดไม่พอก่อนซื้อเหยื่อ", 2)
+        return
     end
+
+    if buyBaitAtShop(n) then
+        purchaseFailStreak = 0
+    else
+        failPurchase("ซื้อเหยื่อไม่สำเร็จ")
+    end
+    needSell = true
+end
+
+--=====================================================================
+--  ตั๋ว PALM ISLAND (ซื้อครั้งเดียวถาวร ที่ร้านเดียวกับเบ็ด)
+--=====================================================================
+-- สั่งเปิดร้านตกปลา เพื่อให้ server ส่งรายการ + สถานะ owned มาให้ (ต้องยืนอยู่ที่ร้าน)
+local function refreshShopData(timeout)
+    local since = tick()
+    pcall(function() RentalRemote:FireServer("OpenFishing") end)
+    return waitFor(function() return shopEventAt >= since end, timeout or 4)
+end
+
+-- ไปร้านครั้งเดียวเพื่อถามว่า "มีตั๋วแล้วหรือยัง" (เปิดร้านให้ server ส่งสถานะ)
+local ticketCheckTries = 0
+local function checkTicketAtShop()
+    ticketCheckTries = ticketCheckTries + 1
+    setStatus("🔎 ไปร้านเช็กว่ามีตั๋ว Palm Island แล้วหรือยัง", Color3.fromRGB(130, 195, 250))
+    goShop()
+    task.wait(1)
+    local got = refreshShopData(4)
+    if not got then
+        stayAtShop()
+        got = refreshShopData(5)
+    end
+
+    if hasPalmTicket() then
+        ticketChecked = true
+        notify("🎫 มีตั๋วแล้ว", "ไปตกที่ Palm Island (" .. ticketSource .. ")", 4)
+    elseif ticketListed then
+        ticketChecked = true
+        notify("🎫 ยังไม่มีตั๋ว", "ร้านบอกว่ายังไม่ได้ซื้อ", 4)
+    elseif ticketCheckTries >= 2 then
+        ticketChecked = true
+        warn("[AutoFish] ⚠️ ร้านไม่ส่งข้อมูล " .. CFG.TICKET_ID .. " มา ถ้าซื้อตั๋วแล้วจริง ให้ตั้ง HAS_TICKET = true")
+        notify("⚠️ เช็กตั๋วไม่ได้", "ถ้ามีตั๋วแล้ว ตั้ง HAS_TICKET = true", 6)
+    end
+end
+
+local function tryBuyTicket()
+    for attempt = 1, 4 do
+        if not (running or manualTest) or not alive() then return false end
+        local before = getCash()
+        setStatus(("🎫 ซื้อตั๋ว Palm Island (ครั้งที่ %d/4)"):format(attempt), Color3.fromRGB(255, 208, 90))
+        pcall(function() RentalRemote:FireServer("BuyFishing", CFG.TICKET_ID) end)
+        task.wait(1.5)
+        -- สำเร็จถ้าเจอตั๋ว หรือเงินสดลดลงเกือบเท่าราคาตั๋ว
+        if hasPalmTicket() or getCash() <= before - math.floor(CFG.TICKET_PRICE * 0.9) then
+            ticketOwned = true
+            if ticketSource == "" then ticketSource = "bought" end
+            return true
+        end
+        setStatus("⏳ server ให้รอที่ร้านเพิ่ม...", Color3.fromRGB(255, 200, 80))
+        task.wait(3)
+    end
+    return false
+end
+
+local function buyPalmTicket()
+    setStatus("🔎 เช็กตั๋ว / เงิน ก่อนซื้อตั๋ว Palm Island")
+    printCheck("ก่อนซื้อตั๋ว")
+    task.wait(0.5)
+    if hasPalmTicket() then return end
+
+    -- 1) ถอนเงินจากธนาคารให้เงินสดพอซื้อตั๋ว
+    if getCash() < CFG.TICKET_PRICE then
+        goATM()
+        if not ensureCash(CFG.TICKET_PRICE) then
+            resyncState("ถอนเงินซื้อตั๋วไม่สำเร็จ", 3)
+            return
+        end
+    end
+
+    -- 2) ไปร้านเดียวกับที่ซื้อเบ็ด ยืนรอ แล้วซื้อตั๋ว
+    goShop()
+    stayAtShop()
+    -- ถามร้านอีกรอบก่อนซื้อ: ถ้าซื้อไปแล้วจะไม่ซื้อซ้ำ
+    refreshShopData(4)
+    if hasPalmTicket() then
+        notify("🎫 มีตั๋วอยู่แล้ว", "ไม่ต้องซื้อซ้ำ (" .. ticketSource .. ")", 4)
+        return
+    end
+    if getCash() < CFG.TICKET_PRICE then
+        resyncState("เงินสดไม่พอก่อนซื้อตั๋ว", 2)
+        return
+    end
+    if not tryBuyTicket() then
+        failPurchase("ซื้อตั๋ว Palm Island ไม่สำเร็จ")
+        return
+    end
+
+    purchaseFailStreak = 0
+    notify("🎫 ได้ตั๋วแล้ว", "ไปตกปลาที่ Palm Island", 4)
     needSell = true
 end
 
@@ -733,6 +1223,7 @@ local function fishRound(zone)
     local lastActivity = tick()
     local active = true
     local startT = tick()
+    local endEarly, failMsg, gotWait = false, nil, false
 
     local conn = FishingRemote.OnClientEvent:Connect(function(...)
         if not running or not active then return end
@@ -742,6 +1233,7 @@ local function fishRound(zone)
             local data = args[2]
             if type(data) ~= "table" then return end
             required = data.required
+            gotWait = true
             lastActivity = tick()
             setStatus(string.format("🎣 Bite! รอบ %s/%s", tostring(data.round), tostring(required)), Color3.fromRGB(255, 220, 100))
             local targetTime = computeReelTime(data, 0.15)
@@ -754,7 +1246,19 @@ local function fishRound(zone)
                 setStatus(string.format("🎣 ส่ง Reel (%d/%d)", reelsSent, required or 0), Color3.fromRGB(120, 220, 120))
             end)
         elseif ev == "Wait" then
+            gotWait = true
             lastActivity = tick()
+        elseif ev == "End" then
+            -- server แจ้งจบ พร้อมข้อความเหตุผล (เช่น โยนที่นี่ไม่ได้ / ไม่มีเหยื่อ / ต้องมีตั๋ว)
+            local msg = args[2]
+            if type(msg) == "string" and msg ~= "" then
+                lastFishMsg = msg
+                print("[AutoFish] 📢 server:", msg)
+            end
+            if not required then          -- จบก่อนมีปลากัด = โยนไม่สำเร็จ
+                endEarly = true
+                failMsg = (type(msg) == "string" and msg ~= "") and msg or "(server จบโดยไม่มีข้อความ)"
+            end
         end
     end)
 
@@ -776,6 +1280,12 @@ local function fishRound(zone)
             success = true
             break
         end
+        if endEarly then break end
+        if not gotWait and not required and tick() - startT > 6 then
+            failMsg = failMsg or "server ไม่ตอบคำสั่งโยน (จุดโยนอาจไม่ใช่น้ำ หรือไม่มีสิทธิ์ตกที่นี่)"
+            lastFishMsg = failMsg
+            break
+        end
         if tick() - lastActivity > 12 then break end
     end
     active = false
@@ -783,9 +1293,16 @@ local function fishRound(zone)
 
     if success then
         catchCount = catchCount + 1
+        if baitBlind > 0 then baitBlind = baitBlind - 1 end
         setStatus(string.format("🐟 ได้ปลา! (%d) ใช้เวลา %.1fs", catchCount, tick() - startT), Color3.fromRGB(120, 255, 120))
     else
-        setStatus("⌛ หมดเวลา ลองเหวี่ยงใหม่", Color3.fromRGB(255, 180, 100))
+        if failMsg then
+            setStatus(("⚠️ โยนเบ็ดที่ %s ไม่สำเร็จ: %s"):format(zone.name, failMsg), Color3.fromRGB(255, 120, 120))
+            notify("⚠️ โยนเบ็ดไม่สำเร็จ", failMsg, 6)
+            task.wait(3)   -- ให้เวลาอ่านข้อความ และกันยิง Cast รัวๆ
+        else
+            setStatus("⌛ หมดเวลา ลองเหวี่ยงใหม่", Color3.fromRGB(255, 180, 100))
+        end
     end
     task.wait(1)
     return success
@@ -795,10 +1312,26 @@ end
 --  MAIN LOGIC
 --=====================================================================
 local function step()
+    -- รอให้ตัวละครเกิดและกระเป๋าโหลดเสร็จก่อนตัดสินใจ (กันเช็กเบ็ด/เหยื่อผิดตอนเพิ่งเกิด)
+    if tick() - lastSpawn < 4 then task.wait(1); return end
+
+    -- ---------- เช็กเบ็ดทุกรอบ ----------
+    if hasRod() then
+        rodOwned = true
+        rodBlind = false
+    elseif rodOwned and not rodBlind then
+        -- เคยมีเบ็ดแต่ตอนนี้หาไม่เจอ: ซิงก์กระเป๋าแล้วเช็กซ้ำก่อนสรุปว่าเบ็ดหาย
+        resyncState("หาเบ็ดไม่เจอ ตรวจกระเป๋าใหม่")
+        if not hasRod() then
+            warn("[AutoFish] ❌ เบ็ดหาย → ต้องซื้อเบ็ดใหม่")
+            rodOwned = false
+        end
+        return
+    end
+
+    -- ---------- เฟส A: ไม่มีเบ็ด -> ฟามเงินให้ครบ แล้วซื้อเบ็ด+เหยื่อ ----------
     if not rodOwned then
-        if hasRod() then
-            rodOwned = true
-        elseif totalMoney() < CFG.TARGET_MONEY then
+        if totalMoney() < CFG.TARGET_MONEY then
             phase = "COOK"
             setStatus(string.format("🍳 ฟามเงิน %d / %d", totalMoney(), CFG.TARGET_MONEY))
             cookOnce()
@@ -813,7 +1346,8 @@ local function step()
         end
     end
 
-    if getBaitCount() <= 0 then
+    -- ---------- เฟส B: มีเบ็ดแล้ว ----------
+    if getEffectiveBait() <= 0 then
         phase = "RESUPPLY"
         if needSell then
             if sellFish() then needSell = false else return end
@@ -829,6 +1363,27 @@ local function step()
         return
     end
 
+    -- ---------- เฟส C: ตั๋ว Palm Island ----------
+    -- 1) ยังไม่รู้สถานะตั๋ว -> ไปร้านเปิดหน้าร้านให้ server ส่งสถานะ (owned) มาก่อน (ทำครั้งเดียว)
+    if not ticketChecked then
+        if hasPalmTicket() then
+            ticketChecked = true
+        else
+            phase = "CHECK"
+            checkTicketAtShop()
+            return
+        end
+    end
+    -- 2) เลเวล 60+ ยังไม่มีตั๋ว: เงินรวม (สด+ธนาคาร) ถึง 2,200,000 -> ถอนไปซื้อตั๋ว
+    --    ยังไม่ถึง -> ฟามต่อ (ตกปลาที่โซนปกติ แล้วเก็บเงินจากการขายปลา)
+    if getFishLevel() >= CFG.PALM_LEVEL and not hasPalmTicket() then
+        if totalMoney() >= CFG.TICKET_MONEY then
+            phase = "TICKET"
+            buyPalmTicket()
+            return
+        end
+    end
+
     local zone = pickZone(getFishLevel())
     curZone = zone
     phase = "FISH"
@@ -839,12 +1394,21 @@ local function step()
         tweenWalk(zone.stand, CFG.SPEED)
         task.wait(0.4)
     end
+    -- ถือเบ็ดตอนถึงจุดตกปลา และเช็กว่าถืออยู่ก่อนโยนทุกครั้ง
     if not ensureRodHeld() and rodFailStreak < 3 then
         setStatus("⚠️ ถือเบ็ดไม่สำเร็จ ลองใหม่", Color3.fromRGB(255, 180, 100))
         task.wait(2)
         return
     end
-    fishRound(zone)
+    if fishRound(zone) then
+        timeoutStreak = 0
+    else
+        timeoutStreak = timeoutStreak + 1
+        if timeoutStreak >= 6 then
+            timeoutStreak = 0
+            resyncState("ตกไม่ติดต่อเนื่อง 6 รอบ")
+        end
+    end
 end
 
 local function mainLoop()
@@ -936,15 +1500,17 @@ player.CharacterAdded:Connect(function(newChar)
     if activeTween then pcall(function() activeTween:Cancel() end) end
     shiftStarted = false
     lastEquipTry = 0
+    lastSpawn = tick()
     if alive() then task.spawn(setupAntiSit, newChar) end
 end)
 
 --=====================================================================
---  ANTI-AFK
+--  ANTI-AFK (กันโดนเตะเมื่อไม่ขยับ)
 --=====================================================================
 local VirtualUser = game:GetService("VirtualUser")
 local afkPings = 0
 
+-- ปิดตัวดักเตะ AFK ของเกม (ถ้า executor รองรับ)
 if type(getconnections) == "function" then
     pcall(function()
         for _, c in ipairs(getconnections(player.Idled)) do
@@ -953,6 +1519,7 @@ if type(getconnections) == "function" then
     end)
 end
 
+-- Roblox ยิง Idled เมื่อไม่ขยับ ~20 นาที -> ส่งคลิกหลอกเพื่อรีเซ็ต
 player.Idled:Connect(function()
     if not alive() then return end
     afkPings = afkPings + 1
@@ -962,6 +1529,7 @@ player.Idled:Connect(function()
     end)
 end)
 
+-- สำรอง: ส่งสัญญาณหลอกทุก 4 นาที เผื่อ Idled ไม่ทำงาน
 task.spawn(function()
     while alive() do
         task.wait(240)
@@ -977,7 +1545,30 @@ task.spawn(function()
 end)
 
 --=====================================================================
---  DASHBOARD UI
+--  AUTO RESPAWN (ล้ม/ตายแล้วกดเกิดเอง)
+--=====================================================================
+task.spawn(function()
+    local deadSince = nil
+    local lastFire = 0
+    while alive() do
+        task.wait(1)
+        local c = player.Character
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health <= 0 then
+            deadSince = deadSince or tick()
+            if tick() - deadSince >= 2 and tick() - lastFire >= 5 then
+                lastFire = tick()
+                print("[AutoFish] ☠️ ตัวละครล้ม/ตาย → กดเกิด")
+                if RespawnRemote then pcall(function() RespawnRemote:FireServer() end) end
+            end
+        else
+            deadSince = nil
+        end
+    end
+end)
+
+--=====================================================================
+--  DASHBOARD UI  (เต็มจอ พื้นหลังขุ่นใส จัดกลาง ไม่ยาว)
 --=====================================================================
 local Lighting = game:GetService("Lighting")
 
@@ -1034,9 +1625,12 @@ local PHASES = {
     COOK     = { "🍳 ฟามเงิน (ทำสเต็ก)",   C.ORANGE },
     BUY      = { "🛒 ซื้อเบ็ด / เหยื่อ",    C.GOLD   },
     RESUPPLY = { "🔄 เติมเหยื่อ / ขายปลา",  C.BLUE   },
+    CHECK    = { "🔎 เช็กตั๋ว Palm Island", C.BLUE   },
+    TICKET   = { "🎫 ซื้อตั๋ว Palm Island", C.GOLD   },
     FISH     = { "🎣 ตกปลา",               C.CYAN   },
 }
 
+-- เบลอฉากหลังให้ดู "ขุ่นใส"
 for _, o in ipairs(Lighting:GetChildren()) do
     if o.Name == "AutoFishBlur" then o:Destroy() end
 end
@@ -1048,6 +1642,7 @@ local gui = mk("ScreenGui", {
     DisplayOrder = 1000, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, player:WaitForChild("PlayerGui"))
 
+-- ---------- พื้นหลังเต็มจอ ----------
 local overlay = mk("Frame", {
     Name = "Overlay", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1),
     BackgroundTransparency = 0.2, BorderSizePixel = 0, Active = true,
@@ -1056,6 +1651,7 @@ mk("UIGradient", {
     Color = ColorSequence.new(Color3.fromRGB(16, 26, 46), Color3.fromRGB(4, 7, 14)), Rotation = 90,
 }, overlay)
 
+-- ---------- แผงกลางจอ (กว้าง ไม่สูง เหมาะกับมือถือแนวนอน) ----------
 local panel = mk("Frame", {
     Name = "Panel", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
     Size = UDim2.fromScale(0.92, 0.84), BackgroundColor3 = C.BG, BackgroundTransparency = 0.3, BorderSizePixel = 0,
@@ -1074,6 +1670,7 @@ local function card(parent, order, size)
     return f
 end
 
+-- ================= คอลัมน์ซ้าย: ตัวละคร =================
 local left = mk("Frame", { Size = UDim2.new(0.27, 0, 1, 0), BackgroundTransparency = 1 }, panel)
 mk("UIListLayout", {
     SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5),
@@ -1125,11 +1722,13 @@ local afkLabel = mk("TextLabel", {
     TextColor3 = C.GREEN, Font = Enum.Font.GothamMedium, TextSize = 11,
 }, left)
 
+-- ================= คอลัมน์ขวา: สถานะ =================
 local right = mk("Frame", { Position = UDim2.new(0.29, 0, 0, 0), Size = UDim2.new(0.71, 0, 1, 0), BackgroundTransparency = 1 }, panel)
 mk("UIListLayout", {
     SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Center,
 }, right)
 
+-- สถานะปัจจุบัน
 local statusCard = card(right, 1, UDim2.new(1, 0, 0.26, 0))
 local dot = mk("Frame", { Position = UDim2.fromOffset(12, 11), Size = UDim2.fromOffset(10, 10), BackgroundColor3 = C.MUTED, BorderSizePixel = 0 }, statusCard)
 corner(dot, 5)
@@ -1145,12 +1744,13 @@ local statusLabel = mk("TextLabel", {
     TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
 }, statusCard)
 
+-- แถบความคืบหน้า 2 อัน เรียงข้างกัน
 local bars = mk("Frame", { LayoutOrder = 2, Size = UDim2.new(1, 0, 0.17, 0), BackgroundTransparency = 1 }, right)
 mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, bars)
 
 local function makeBar(order, title, color)
     local c = card(bars, order, UDim2.new(0.5, -4, 1, 0))
-    mk("TextLabel", {
+    local ttl = mk("TextLabel", {
         Position = UDim2.fromOffset(10, 4), Size = UDim2.new(0.55, 0, 0, 14), BackgroundTransparency = 1,
         Text = title, TextColor3 = C.MUTED, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
         TextTruncate = Enum.TextTruncate.AtEnd,
@@ -1164,7 +1764,9 @@ local function makeBar(order, title, color)
     corner(track, 3)
     local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = color, BorderSizePixel = 0 }, track)
     corner(fill, 3)
-    return function(text, ratio)
+    -- newTitle (ไม่บังคับ) ใช้เปลี่ยนหัวข้อแถบ เช่น ตอนเปลี่ยนเป้าหมายเป็นตั๋ว
+    return function(text, ratio, newTitle)
+        if newTitle then ttl.Text = newTitle end
         val.Text = text
         TweenService:Create(fill, TweenInfo.new(0.4, Enum.EasingStyle.Quad), { Size = UDim2.new(math.clamp(ratio, 0, 1), 0, 1, 0) }):Play()
     end
@@ -1172,6 +1774,7 @@ end
 local setMoneyBar = makeBar(1, "💰 เป้าหมายซื้อเบ็ด", C.GOLD)
 local setBaitBar  = makeBar(2, "🪱 เหยื่อ", C.ORANGE)
 
+-- ตัวเลข 6 ช่อง (3 คอลัมน์ x 2 แถว)
 local grid = mk("Frame", { LayoutOrder = 3, Size = UDim2.new(1, 0, 0.37, 0), BackgroundTransparency = 1 }, right)
 mk("UIGridLayout", {
     CellSize = UDim2.new(1 / 3, -6, 0.5, -4), CellPadding = UDim2.fromOffset(8, 8), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -1199,6 +1802,7 @@ local vFish  = makeStat(4, "🐟 ปลาในตัว", C.CYAN)
 local vLevel = makeStat(5, "🎣 เลเวลตกปลา", C.GOLD)
 local vCatch = makeStat(6, "✅ ตกได้รอบนี้", C.GREEN)
 
+-- คอนฟิกที่ใช้อยู่
 local cfgCard = card(right, 4, UDim2.new(1, 0, 0.09, 0))
 local cfgLabel = mk("TextLabel", {
     Size = UDim2.new(1, -16, 1, 0), Position = UDim2.fromOffset(8, 0), BackgroundTransparency = 1,
@@ -1206,6 +1810,7 @@ local cfgLabel = mk("TextLabel", {
 }, cfgCard)
 mk("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 8 }, cfgLabel)
 
+-- ---------- ปุ่มเล็กมุมขวาบน (ซ่อนหน้าจอ / หยุดชั่วคราว) ----------
 local ctrl = mk("Frame", {
     AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 12), Size = UDim2.fromOffset(84, 38),
     BackgroundTransparency = 1,
@@ -1234,6 +1839,7 @@ hideBtn.MouseButton1Click:Connect(function()
     hideBtn.Text = overlayShown and "👁" or "🙈"
 end)
 
+-- ---------- Toast (แจ้งเตือนสั้นๆ ล่างจอ) ----------
 local toast = mk("TextLabel", {
     AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -14), Size = UDim2.fromOffset(0, 0),
     AutomaticSize = Enum.AutomaticSize.XY, BackgroundColor3 = C.CARD, BackgroundTransparency = 0.15, BorderSizePixel = 0,
@@ -1257,6 +1863,7 @@ statusSetter = function(text, color)
     dot.BackgroundColor3 = color or C.MUTED
 end
 
+-- ---------- Run / Pause ----------
 local function setRunning(state)
     running = state and true or false
     if running then
@@ -1272,6 +1879,7 @@ local function setRunning(state)
 end
 pauseBtn.MouseButton1Click:Connect(function() setRunning(not running) end)
 
+-- ---------- Refresh ----------
 local startClock = os.time()
 
 local function refresh()
@@ -1286,12 +1894,22 @@ local function refresh()
     vCatch.Text = tostring(catchCount)
     badgeText.Text = "🎣 Fishing Lv " .. lv
 
-    if rodOwned or hasRod() then
-        setMoneyBar("✅ ได้เบ็ดแล้ว", 1)
+    local haveRod = rodOwned or hasRod()
+    if haveRod and (lv >= CFG.PALM_LEVEL or hasPalmTicket()) then
+        -- เลเวล 60+: แถบเงินเปลี่ยนเป็นเป้าหมายตั๋ว Palm Island
+        if hasPalmTicket() then
+            setMoneyBar("✅ มีตั๋วแล้ว", 1, "🎫 ตั๋ว Palm Island")
+        else
+            local total = cash + bank
+            setMoneyBar(("$%s / $%s"):format(fmt(total), fmt(CFG.TICKET_MONEY)),
+                total / math.max(CFG.TICKET_MONEY, 1), "🎫 เป้าหมายตั๋ว Palm")
+        end
+    elseif haveRod then
+        setMoneyBar("✅ ได้เบ็ดแล้ว", 1, "💰 เป้าหมายซื้อเบ็ด")
     else
         local total = cash + bank
         local ratio = total / math.max(CFG.TARGET_MONEY, 1)
-        setMoneyBar(("$%s / $%s"):format(fmt(total), fmt(CFG.TARGET_MONEY)), ratio)
+        setMoneyBar(("$%s / $%s"):format(fmt(total), fmt(CFG.TARGET_MONEY)), ratio, "💰 เป้าหมายซื้อเบ็ด")
     end
     setBaitBar(("%d / %d"):format(bait, CFG.BAIT_COUNT), bait / math.max(CFG.BAIT_COUNT, 1))
 
@@ -1308,8 +1926,19 @@ local function refresh()
     avatarStroke.Color = color
     pauseBtn.Text = running and "⏸" or "▶"
 
-    cfgLabel.Text = ("⚙ เป้าหมาย $%s  •  ฝากที่ $%s  •  เหยื่อ %d  •  เดิน %d")
-        :format(fmt(CFG.TARGET_MONEY), fmt(CFG.DEPOSIT_AT), CFG.BAIT_COUNT, CFG.SPEED)
+    -- สถานะตั๋ว Palm Island + ข้อความล่าสุดจาก server ตอนตกปลา (บอกสาเหตุถ้าโยนไม่ติด)
+    local tState
+    if hasPalmTicket() then
+        tState = "✔ มีแล้ว (" .. ticketSource .. ")"
+    elseif ticketListed then
+        tState = "✘ ยังไม่มี"
+    elseif ticketChecked then
+        tState = "? เช็กไม่ได้"
+    else
+        tState = "… ยังไม่เช็ก"
+    end
+    cfgLabel.Text = ("🎫 ตั๋ว Palm: %s  •  Lv %d  •  server: %s")
+        :format(tState, lv, lastFishMsg ~= "" and lastFishMsg:sub(1, 48) or "-")
     afkLabel.Text = afkPings > 0 and ("🛡 Anti-AFK: ON (กันแล้ว %d)"):format(afkPings) or "🛡 Anti-AFK: ON"
     local up = os.time() - startClock
     uptimeLabel.Text = ("⏱ %02d:%02d:%02d"):format(math.floor(up / 3600), math.floor(up / 60) % 60, up % 60)
@@ -1327,6 +1956,23 @@ end)
 --=====================================================================
 --  START
 --=====================================================================
+-- ดัมป์ข้อมูลตั๋วลงคอนโซลครั้งเดียว (ไว้ดูว่า PalmIslandTicket หน้าตาเป็นยังไง)
+task.spawn(function()
+    task.wait(3)
+    pcall(function()
+        local o = player.PlayerGui.MD_HouseRentalGui.MD_JackFarmShop.Catalogue:FindFirstChild(CFG.TICKET_ID)
+        if not o then print("[AutoFish] 🎫 ไม่พบ Catalogue." .. CFG.TICKET_ID) return end
+        print("[AutoFish] 🎫 พบ", o:GetFullName(), o.ClassName,
+            "| สถานะการ์ด (true=OWNED, false=ยังไม่ซื้อ):", tostring(ticketCardState()))
+        for k, v in pairs(o:GetAttributes()) do print("  attr", k, tostring(v)) end
+        for _, d in ipairs(o:GetDescendants()) do
+            local extra = ""
+            if d:IsA("TextLabel") or d:IsA("TextButton") then extra = " '" .. d.Text .. "'" end
+            print("  child", d:GetFullName():sub(#o:GetFullName() + 2), d.ClassName, extra)
+        end
+    end)
+end)
+
 setStatus("เริ่มระบบ...", C.ACCENT)
 setRunning(true)
-print("[AutoFishLevel] ✅ Loaded (cooking portion patched)")
+print("[AutoFishLevel] ✅ Loaded")
